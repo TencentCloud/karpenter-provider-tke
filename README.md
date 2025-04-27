@@ -4,7 +4,7 @@ https://karpenter.sh/
 
 # Install
 
-Get secretID and secretKey form https://console.cloud.tencent.com/cam/capi and create secret in your k8s cluster:
+Get secretID and secretKey from https://console.cloud.tencent.com/cam/capi and create secret in your k8s cluster:
 
 ```sh
 kubectl create namespace karpenter
@@ -40,7 +40,7 @@ helm upgrade --install karpenter https://github.com/tencentcloud/karpenter-provi
 
 # CR example
 
-Modify the folling yaml and apply it to your cluster.
+Modify the following yaml and apply it to your cluster.
 
 ```yaml
 ---
@@ -176,7 +176,7 @@ You can use `describe tmnc xxx` to check your subenets' `zone` and `zone ID`.
 
 # About Drift
 
-Karpenter has been set `dirt` promote to stable and not allowed to disable in `karpenter core`. Please check https://github.com/kubernetes-sigs/karpenter/pull/1311.
+Karpenter has been set `drift` promote to stable and not allowed to disable in `karpenter core`. Please check https://github.com/kubernetes-sigs/karpenter/pull/1311.
 
 We thinks it's is a `dangerous` feature, so `karpenter tke provider` doesn't implement it yet.
 
