@@ -1,0 +1,57 @@
+/*
+Copyright (C) 2012-2025 Tencent. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"github.com/tencentcloud/karpenter-provider-tke/pkg/cloudprovider"
+	"github.com/tencentcloud/karpenter-provider-tke/pkg/controllers"
+	"github.com/tencentcloud/karpenter-provider-tke/pkg/operator"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider/metrics"
+	kcontrollers "sigs.k8s.io/karpenter/pkg/controllers"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	koreoperator "sigs.k8s.io/karpenter/pkg/operator"
+)
+
+func main() {
+	ctx, op := operator.NewOperator(koreoperator.NewOperator())
+
+	cloudProvider := metrics.Decorate(cloudprovider.NewCloudProvider(ctx, op.GetClient(), op.MachineProvider,
+		op.InstanceTypeProvider, op.ZoneProvider))
+	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider)
+	op.
+		WithControllers(ctx, kcontrollers.NewControllers(
+			ctx,
+			op.Manager,
+			op.Clock,
+			op.GetClient(),
+			op.EventRecorder,
+			cloudProvider,
+			clusterState,
+		)...).
+		WithControllers(ctx, controllers.NewControllers(
+			ctx,
+			op.Clock,
+			op.GetClient(),
+			op.EventRecorder,
+			cloudProvider,
+			op.InstanceTypeProvider,
+			op.ZoneProvider,
+			op.VPCProvider,
+			op.SSHKeyProvider,
+		)...).
+		Start(ctx)
+}
