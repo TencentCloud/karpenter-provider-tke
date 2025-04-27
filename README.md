@@ -94,22 +94,22 @@ metadata:
   annotations:
     kubernetes.io/description: "General purpose TKEMachineNodeClass"
 spec:
-  ## using kubectl explain tmnc.spec.internetAccessible to check how to use internetAccessible filed.
+  ## using kubectl explain tmnc.spec.internetAccessible to check how to use internetAccessible field.
   # internetAccessible:
   #   chargeType: TrafficPostpaidByHour
   #   maxBandwidthOut: 2
-  ## using kubectl explain tmnc.spec.systemDisk to check how to use systemDisk filed.
+  ## using kubectl explain tmnc.spec.systemDisk to check how to use systemDisk field.
   # systemDisk:
   #   size: 60
   #   type: CloudSSD
-  ## using kubectl explain tmnc.spec.dataDisks to check how to use systemDisk filed.
+  ## using kubectl explain tmnc.spec.dataDisks to check how to use systemDisk field.
   # dataDisks:
   # - mountTarget: /var/lib/container
   #   size: 100
   #   type: CloudPremium
   #   fileSystem: ext4
   subnetSelectorTerms:
-    # repalce your tag which is already existed in https://console.cloud.tencent.com/tag/taglist
+    # replace your tag which is already existed in https://console.cloud.tencent.com/tag/taglist
     - tags:
         karpenter.sh/discovery: cls-xxx
     # - id: subnet-xxx
@@ -172,17 +172,17 @@ Status:
 
 TKE set `zone ID` to label `topology.kubernetes.io/zone` like `topology.kubernetes.io/zone: "900001"`, and use `zone` to label `topology.com.tencent.cloud.csi.cbs/zone` like `topology.com.tencent.cloud.csi.cbs/zone: ap-singapore-1`.
 
-You can use `describe tmnc xxx` to check your subenets' `zone` and `zone ID`.
+You can use `describe tmnc xxx` to check your subnets' `zone` and `zone ID`.
 
 # About Drift
 
 Karpenter has been set `drift` promote to stable and not allowed to disable in `karpenter core`. Please check https://github.com/kubernetes-sigs/karpenter/pull/1311.
 
-We thinks it's is a `dangerous` feature, so `karpenter tke provider` doesn't implement it yet.
+We thinks it is a `dangerous` feature, so `karpenter tke provider` doesn't implement it yet.
 
-1. If you has modified the tmnc CR, the exisiting `old` node/nodeclaim will be not replaced. Your modfication will only effect the `new` node/nodeclaim.
+1. If you has modified the tmnc CR, the existing `old` node/nodeclaim will be not replaced. Your modification will only effect the `new` node/nodeclaim.
 
-2. If you has modified the nodepool CR, and the existing nodeclaim's label(s) aren't compatible with nodepool requirements, the `old` node/nodeclaim wiil be replaced.
+2. If you has modified the nodepool CR, and the existing nodeclaim's label(s) aren't compatible with nodepool requirements, the `old` node/nodeclaim will be replaced.
 
 For example, the old nodeclaim's has label: `karpenter.k8s.tke/instance-cpu: 2`. But nodepool's requirements is modified to:
 
@@ -197,7 +197,7 @@ template:
 
 Since `karpenter.k8s.tke/instance-cpu: 2` is not `Gt` `2`, this nodeclaim will be replaced.
 
-If you want to ignore `Drifited` in disruption, you should add following disruption settings in your `nodepool`:
+If you want to ignore `Drifted` in disruption, you should add following disruption settings in your `nodepool`:
 
 ```yaml
   disruption:
@@ -211,7 +211,7 @@ If you want to ignore `Drifited` in disruption, you should add following disrupt
 
 More details, please check https://github.com/kubernetes-sigs/karpenter/issues/1576 .
 
-# Related Tencentcloud api(s)
+# Related Tencentcloud API(s)
 
 The controller should be allowed to access following api(s):
 
