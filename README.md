@@ -27,7 +27,7 @@ Install/Upgrade with chart:
 
 ```sh
 # replace your TKE cluster ID and the region where your TKE cluster is located 
-helm upgrade --install karpenter https://github.com/tencentcloud/karpenter-provider-tke/raw/refs/heads/main/charts/karpenter-0.1.7.tgz --namespace "karpenter" --create-namespace \
+helm upgrade --install karpenter https://github.com/tencentcloud/karpenter-provider-tke/raw/refs/heads/main/charts/karpenter-0.2.0.tgz --namespace "karpenter" --create-namespace \
   --set "settings.clusterID=cls-xxxx" \
   --set "settings.region=ap-singapore" \
   --set controller.resources.requests.cpu=0.1 \
@@ -224,6 +224,10 @@ The controller should be allowed to access following api(s):
 7. vpc:DescribeSubnetEx
 
 # Changelog
+v0.2.0
+1. Update karpenter to v1.3.2
+2. Fix topology spread constraints with zonal volume
+
 v0.1.7
 1. Optimize the retry strategy for insufficient Spot quota errors.
 2. Add a blacklist mechanism for instance types and improve the retry strategy for unknown errors.
