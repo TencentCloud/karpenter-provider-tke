@@ -1,6 +1,4 @@
-FROM alpine:3.20
-
-RUN echo "hosts: files dns" >> /etc/nsswitch.conf
+FROM mirrors.tencent.com/tencentos/tencentos4-rt-static:latest
 
 WORKDIR /app
 ADD bin/karpenter-tke-controller /app/bin/

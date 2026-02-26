@@ -40,7 +40,8 @@ func NewControllers(ctx context.Context, clk clock.Clock, kubeClient client.Clie
 	cloudProvider cloudprovider.CloudProvider, instancetypeProvier instancetype.Provider, zoneProvider zone.Provider, vpcProvider vpc.Provider, sshKeyProvider sshkey.Provider) []controller.Controller {
 
 	controllers := []controller.Controller{
-		nodeclaimproviderid.NewController(kubeClient),
+		nodeclaimproviderid.NewControllerNodeClaim(kubeClient),
+		nodeclaimproviderid.NewControllerMachine(kubeClient),
 		nodeclaimgarbagecollection.NewController(kubeClient, cloudProvider),
 		nodeclaimfailure.NewController(kubeClient, instancetypeProvier),
 		nodeclassstatus.NewController(kubeClient, zoneProvider, vpcProvider, sshKeyProvider),

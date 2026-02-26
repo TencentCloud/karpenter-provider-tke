@@ -114,20 +114,30 @@ func (p *DefaultProvider) List(ctx context.Context,
 	if item, ok := p.providerCache.Get(odkey); ok {
 		odTypes = item.([]cxm.InstanceTypeQuotaItem)
 	} else {
-		odTypes, err = p.getInstanceTypes(ctx, false, refresh, nodeClass)
+		odTypesAMD, err := p.getInstanceTypes(ctx, "amd64", false, refresh, nodeClass)
 		if err != nil {
-			return nil, fmt.Errorf("get on-demand instance types failed: %v", err)
+			return nil, fmt.Errorf("get on-demand amd64 instance types failed: %v", err)
 		}
+		odTypesARM, err := p.getInstanceTypes(ctx, "arm64", false, refresh, nodeClass)
+		if err != nil {
+			return nil, fmt.Errorf("get on-demand arm64 instance types failed: %v", err)
+		}
+		odTypes = append(odTypesAMD, odTypesARM...)
 		p.providerCache.SetDefault(odkey, odTypes)
 	}
 
 	if item, ok := p.providerCache.Get(spotkey); ok {
 		spotTypes = item.([]cxm.InstanceTypeQuotaItem)
 	} else {
-		spotTypes, err = p.getInstanceTypes(ctx, true, refresh, nodeClass)
+		spotTypesAMD, err := p.getInstanceTypes(ctx, "amd64", true, refresh, nodeClass)
 		if err != nil {
-			return nil, fmt.Errorf("get spot instance types failed: %v", err)
+			return nil, fmt.Errorf("get spot amd64 instance types failed: %v", err)
 		}
+		spotTypesARM, err := p.getInstanceTypes(ctx, "arm64", true, refresh, nodeClass)
+		if err != nil {
+			return nil, fmt.Errorf("get spot arm64 instance types failed: %v", err)
+		}
+		spotTypes = append(spotTypesAMD, spotTypesARM...)
 		p.providerCache.SetDefault(spotkey, spotTypes)
 	}
 
@@ -273,7 +283,7 @@ func (p *DefaultProvider) isBlocked(instName, capacityType, zone string) bool {
 	return false
 }
 
-func (p *DefaultProvider) getInstanceTypes(ctx context.Context, isSpot, refresh bool, nodeClass *api.TKEMachineNodeClass) ([]cxm.InstanceTypeQuotaItem, error) {
+func (p *DefaultProvider) getInstanceTypes(ctx context.Context, arch string, isSpot, refresh bool, nodeClass *api.TKEMachineNodeClass) ([]cxm.InstanceTypeQuotaItem, error) {
 	filters := []*tke2018.Filter{}
 	nodeClaimList := &v1.NodeClaimList{}
 	if err := p.rtclient.List(ctx, nodeClaimList); err != nil {
@@ -302,6 +312,11 @@ func (p *DefaultProvider) getInstanceTypes(ctx context.Context, isSpot, refresh 
 		Values: zones,
 	}
 
+	archFilter := tke2018.Filter{
+		Name:   lo.ToPtr("architecture"),
+		Values: []*string{lo.ToPtr(arch)},
+	}
+
 	chargeTypeFilter := tke2018.Filter{
 		Name:   lo.ToPtr("instance-charge-type"),
 		Values: nil,
@@ -312,7 +327,7 @@ func (p *DefaultProvider) getInstanceTypes(ctx context.Context, isSpot, refresh 
 		chargeTypeFilter.Values = []*string{lo.ToPtr("POSTPAID_BY_HOUR")}
 	}
 
-	filters = append(filters, &zoneFilter, &chargeTypeFilter)
+	filters = append(filters, &zoneFilter, &archFilter, &chargeTypeFilter)
 
 	if refresh {
 		refreshFilter := tke2018.Filter{
@@ -356,7 +371,10 @@ func (p *DefaultProvider) getInstanceTypes(ctx context.Context, isSpot, refresh 
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal instanceTypeQuotaSet: %v", err)
 	}
-	return *instanceTypes, nil
+	return lo.Map(*instanceTypes, func(instance cxm.InstanceTypeQuotaItem, _ int) cxm.InstanceTypeQuotaItem {
+		instance.Arch = arch
+		return instance
+	}), nil
 }
 
 func (p *DefaultProvider) createOfferings(ctx context.Context, capacityType string, insType cxm.InstanceTypeQuotaItem) []*cloudprovider.Offering {

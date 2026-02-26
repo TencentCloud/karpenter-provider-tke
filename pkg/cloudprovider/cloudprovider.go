@@ -259,6 +259,7 @@ func (c CloudProvider) resolveMachineToInstanceType(ctx context.Context, machine
 	kubletVersion, err := semver.Make(lo.FromPtr(machine.Spec.KubeletVersion))
 	cxmInstanceType := cxm.InstanceTypeQuotaItem{}
 	cxmInstanceType.Zone = machine.Spec.Zone
+	cxmInstanceType.Arch = machine.GetLabels()[corev1.LabelArchStable]
 	cxmInstanceType.InstanceType = spec.InstanceType
 	cxmInstanceType.InstanceFamily = machine.GetLabels()[api.LabelInstanceFamily]
 	cxmInstanceType.CPU, err = strconv.Atoi(machine.GetLabels()[api.LabelInstanceCPU])
@@ -403,6 +404,10 @@ func resourceListFromAnnotations(group string, annotations map[string]string) co
 	eip, found := annotations[group+api.AnnotationEIP]
 	if found {
 		r[corev1.ResourceName(api.TKELabelEIP)] = resource.MustParse(eip)
+	}
+	gpu, found := annotations[group+api.AnnotationGPUCount]
+	if found {
+		r[corev1.ResourceName(api.ResourceNVIDIAGPU)] = resource.MustParse(gpu)
 	}
 
 	return r

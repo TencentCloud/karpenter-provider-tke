@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"path"
 	"sort"
 	"strconv"
@@ -33,6 +34,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/apis/core"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -143,6 +146,7 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 		api.LabelInstanceFamily:   instanceTypes[0].Requirements.Get(api.LabelInstanceFamily).Values()[0],
 		api.LabelInstanceCPU:      instanceTypes[0].Requirements.Get(api.LabelInstanceCPU).Values()[0],
 		api.LabelInstanceMemoryGB: instanceTypes[0].Requirements.Get(api.LabelInstanceMemoryGB).Values()[0],
+		corev1.LabelArchStable:    instanceTypes[0].Requirements.Get(corev1.LabelArchStable).Values()[0],
 		v1.CapacityTypeLabelKey:   instanceTypes[0].Offerings.Available().Compatible(schedulingRequirements).Cheapest().Requirements.Get(v1.CapacityTypeLabelKey).Any(),
 	})
 	//TODO may be conflict with existed machineset
@@ -157,6 +161,7 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 		machine.Spec.ProviderSpec.Type = capiv1beta1.MachineTypeNative
 		providerSpec.InstanceChargeType = capiv1beta1.PostpaidByHourChargeType
 	}
+
 	machine.OwnerReferences = []metav1.OwnerReference{{
 		APIVersion: nodeClaim.APIVersion,
 		Kind:       nodeClaim.Kind,
@@ -179,12 +184,42 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 		providerSpec.SystemDisk.DiskSize = 50
 		providerSpec.SystemDisk.DiskType = capiv1beta1.CloudPremiumDiskType
 	}
-	for _, d := range nodeClass.Spec.DataDisks {
+	dataDisksThroughput := p.getTargetAnnotations(api.AnnotationDataDisksThroughputKey, nodeClass.GetAnnotations())
+	dataDisksEncrypt := p.getTargetAnnotations(api.AnnotationDataDisksEncryptKey, nodeClass.GetAnnotations())
+	dataDisksKMSID := p.getTargetAnnotations(api.AnnotationDataDisksKMSID, nodeClass.GetAnnotations())
+	dataDisksSnapshotID := p.getTargetAnnotations(api.AnnotationDataDisksSnapshotID, nodeClass.GetAnnotations())
+	dataDisksImageCacheID := p.getTargetAnnotations(api.AnnotationDataDisksImageCacheID, nodeClass.GetAnnotations())
+	for i, d := range nodeClass.Spec.DataDisks {
 		cxmDisk := capiv1beta1.CXMDisk{
 			DiskType:           capiv1beta1.DiskType(d.Type),
 			DiskSize:           d.Size,
 			DeleteWithInstance: lo.ToPtr(true),
 			FileSystem:         string(api.FileSystemEXT4),
+		}
+		throughput, ok := dataDisksThroughput[fmt.Sprintf("%d", i)]
+		if ok {
+			// Validate and convert throughput string to int
+			if throughputInt, err := strconv.Atoi(throughput); err == nil {
+				cxmDisk.ThroughputPerformance = throughputInt
+			} else {
+				klog.Warningf("invalid throughput value for data disk %d: %s, error: %v", i, throughput, err)
+			}
+		}
+		encrypt, ok := dataDisksEncrypt[fmt.Sprintf("%d", i)]
+		if ok {
+			cxmDisk.Encrypt = encrypt
+		}
+		kmsID, ok := dataDisksKMSID[fmt.Sprintf("%d", i)]
+		if ok {
+			cxmDisk.KmsKeyId = kmsID
+		}
+		snapshotID, ok := dataDisksSnapshotID[fmt.Sprintf("%d", i)]
+		if ok {
+			cxmDisk.SnapshotId = snapshotID
+		}
+		imageCacheID, ok := dataDisksImageCacheID[fmt.Sprintf("%d", i)]
+		if ok {
+			cxmDisk.ImageCacheId = imageCacheID
 		}
 		if d.FileSystem != nil {
 			cxmDisk.FileSystem = string(lo.FromPtr(d.FileSystem))
@@ -220,6 +255,65 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 		result := strings.Split(k, api.AnnotationKubeletArgPrefix)
 		if len(result) == 2 {
 			providerSpec.Management.KubeletArgs = append(providerSpec.Management.KubeletArgs, fmt.Sprintf("%s=%s", result[1], v))
+		}
+		result = strings.Split(k, api.AnnotationKernelArgPrefix)
+		if len(result) == 2 {
+			providerSpec.Management.KernelArgs = append(providerSpec.Management.KernelArgs, fmt.Sprintf("%s=%s", result[1], v))
+		}
+		result = strings.Split(k, api.AnnotationHostsPrefix)
+		if len(result) == 2 {
+			if net.ParseIP(result[1]) == nil {
+				klog.Warningf("invalid IP address in host alias: %s", result[1])
+				continue
+			}
+			host := core.HostAlias{}
+			host.IP = result[1]
+			host.Hostnames = strings.Split(strings.ReplaceAll(v, " ", ""), ",")
+			providerSpec.Management.Hosts = append(providerSpec.Management.Hosts, host)
+		}
+		if k == api.AnnotationNameserversKey {
+			result = strings.Split(strings.ReplaceAll(v, " ", ""), ",")
+			if len(result) > 0 {
+				providerSpec.Management.Nameservers = append(providerSpec.Management.Nameservers, result...)
+				providerSpec.Management.Nameservers = lo.Uniq(providerSpec.Management.Nameservers)
+			}
+		}
+		if k == api.AnnotationHostnameKey {
+			if len(v) > 0 {
+				providerSpec.HostName = v
+			}
+		}
+		if k == api.AnnotationRuntimeRootKey {
+			if len(v) > 0 {
+				machine.Spec.RuntimeRootDir = v
+			}
+		}
+		if _, ok := instanceTypes[0].Capacity[corev1.ResourceName(api.ResourceNVIDIAGPU)]; ok {
+			if k == api.AnnotationGPUDriverKey {
+				if len(v) > 0 {
+					machine.Spec.GPUConfig.Driver = v
+				}
+			}
+			if k == api.AnnotationGPUCUDAKey {
+				if len(v) > 0 {
+					machine.Spec.GPUConfig.CUDA = v
+				}
+			}
+			if k == api.AnnotationGPUCUDNNKey {
+				if len(v) > 0 {
+					machine.Spec.GPUConfig.CUDNN = v
+				}
+			}
+			if k == api.AnnotationGPUMIGEnableKey {
+				if v == "true" {
+					machine.Spec.GPUConfig.MIGEnable = true
+				}
+			}
+			if k == api.AnnotationFabricKey {
+				if v == "true" {
+					machine.Spec.GPUConfig.Fabric = true
+				}
+			}
 		}
 	}
 	providerSpec.Management.KubeletArgs = append(providerSpec.Management.KubeletArgs, fmt.Sprintf("register-with-taints=%s", v1.UnregisteredNoExecuteTaint.ToString()))
@@ -281,6 +375,10 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 	if c, ok := instanceTypes[0].Capacity[corev1.ResourceName(api.TKELabelEIP)]; ok {
 		machine.Annotations[api.CapacityGroup+api.AnnotationEIP] = c.String()
 	}
+	if c, ok := instanceTypes[0].Capacity[corev1.ResourceName(api.ResourceNVIDIAGPU)]; ok {
+		machine.Annotations[api.CapacityGroup+api.AnnotationGPUCount] = c.String()
+	}
+
 	if len(nodeClass.Spec.Tags) != 0 {
 		tags := lo.MapToSlice(nodeClass.Spec.Tags, func(k string, value string) Tag { return Tag{TagKey: k, TagValue: value} })
 		tagsByte, err := json.Marshal(tags)
@@ -290,8 +388,29 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 		machine.Annotations[capiv1beta1.AnnotationMachineCloudTag] = string(tagsByte)
 	}
 
+	machine.Spec.Annotations = p.getTargetAnnotations(api.AnnotationMachineSpecAnnotationsKey, nodeClaim.GetAnnotations())
+
+	for k, v := range p.getTargetAnnotations(api.AnnotationMachineMetaAnnotationsKey, nodeClaim.GetAnnotations()) {
+		machine.Annotations[k] = v
+	}
+
 	err = p.kubeClient.Create(ctx, machine)
 	return machine, providerSpec, err
+}
+func (p *DefaultProvider) getTargetAnnotations(targetKey string, annotations map[string]string) map[string]string {
+	// annotation value of the form "key1=value1,key2=value2"
+	if val, found := annotations[targetKey]; found {
+		annos := strings.Split(val, ",")
+		kv := make(map[string]string, len(annos))
+		for _, anno := range annos {
+			split := strings.SplitN(anno, "=", 2)
+			if len(split) == 2 {
+				kv[split[0]] = split[1]
+			}
+		}
+		return kv
+	}
+	return nil
 }
 
 func (p *DefaultProvider) Delete(ctx context.Context, nodeClaim *v1.NodeClaim) error {
@@ -319,6 +438,7 @@ func (p *DefaultProvider) Delete(ctx context.Context, nodeClaim *v1.NodeClaim) e
 		for _, m := range machineList.Items {
 			for _, o := range m.OwnerReferences {
 				if o.Kind == "NodeClaim" && o.Name == nodeClaim.Name {
+					machine = &m
 					return p.kubeClient.Delete(ctx, machine)
 				}
 			}

@@ -80,8 +80,22 @@ func getSubnetFilterSets(terms []api.SubnetSelectorTerm) (res [][]*vpc2017.Filte
 			res = append(res, filters)
 		}
 	}
+
 	if len(idFilter.Values) > 0 {
-		res = append(res, []*vpc2017.Filter{idFilter})
+		// DescribeSubnets limit 5 subnets id
+		batchSize := 5
+		for i := 0; i < len(idFilter.Values); i += batchSize {
+			end := i + batchSize
+			if end > len(idFilter.Values) {
+				end = len(idFilter.Values)
+			}
+
+			batchFilter := &vpc2017.Filter{
+				Name:   lo.ToPtr("subnet-id"),
+				Values: idFilter.Values[i:end],
+			}
+			res = append(res, []*vpc2017.Filter{batchFilter})
+		}
 	}
 	return res
 }

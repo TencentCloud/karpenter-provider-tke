@@ -92,6 +92,8 @@ var (
 	SystemReservedGroup    = "system-reserved." + Group
 	EvictionThresholdGroup = "eviction-threshold." + Group
 
+	LabelProviderIDInitialized = Group + "/provider-id-initialized"
+
 	LabelNodeClass = Group + "/tkemachinenodeclass"
 	LabelNodeClaim = Group + "/nodeclaim"
 
@@ -130,9 +132,30 @@ var (
 	AnnotationManagedBy    = Group + "/managed-by"
 	AnnotationUnitPrice    = Group + "/unit-price"
 
-	AnnotationKubeletArgPrefix = "beta." + Group + ".kubelet.arg/"
+	AnnotationKubeletArgPrefix          = "beta." + Group + ".kubelet.arg/"
+	AnnotationKernelArgPrefix           = "beta." + Group + ".kernel.arg/"
+	AnnotationHostsPrefix               = "beta." + Group + ".hosts.ip/"
+	AnnotationGPUDriverKey              = "beta." + Group + ".gpu/driver"
+	AnnotationGPUCUDAKey                = "beta." + Group + ".gpu/cuda"
+	AnnotationGPUCUDNNKey               = "beta." + Group + ".gpu/cudnn"
+	AnnotationGPUMIGEnableKey           = "beta." + Group + ".gpu/mig-enable"
+	AnnotationFabricKey                 = "beta." + Group + ".gpu/fabric"
+	AnnotationRuntimeRootKey            = "beta." + Group + ".machine/runtime-root"
+	AnnotationHostnameKey               = "beta." + Group + ".machine/hostname"
+	AnnotationNameserversKey            = "beta." + Group + ".machine/nameservers"
+	AnnotationMachineSpecAnnotationsKey = "beta." + Group + ".machine.spec/annotations"
+	AnnotationMachineMetaAnnotationsKey = "beta." + Group + ".machine.meta/annotations"
+	AnnotationDataDisksThroughputKey    = "beta." + Group + ".datadisks/throughput"
+	AnnotationDataDisksEncryptKey       = "beta." + Group + ".datadisks/encrypt"
+	AnnotationDataDisksKMSID            = "beta." + Group + ".datadisks/kms-id"
+	AnnotationDataDisksSnapshotID       = "beta." + Group + ".datadisks/snapshot-id"
+	AnnotationDataDisksImageCacheID     = "beta." + Group + ".datadisks/image-cache-id"
 )
 
 var (
 	TerminationFinalizer = Group + "/termination"
+)
+
+var (
+	ResourceNVIDIAGPU = "nvidia.com/gpu"
 )

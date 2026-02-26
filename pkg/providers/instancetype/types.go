@@ -118,10 +118,14 @@ func NewInstanceType(ctx context.Context, region string, storageInGB int32, inst
 
 //nolint:gocyclo
 func computeRequirements(offerings cloudprovider.Offerings, region string, instanceTypeInfo cxm.InstanceTypeQuotaItem) scheduling.Requirements {
+	arch := instanceTypeInfo.Arch
+	if len(arch) == 0 {
+		arch = "amd64"
+	}
 	requirements := scheduling.NewRequirements(
 		// Well Known Upstream
 		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, instanceTypeInfo.InstanceType),
-		scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+		scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, arch),
 		scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, "linux"),
 		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, lo.Map(offerings.Available(), func(o *cloudprovider.Offering, _ int) string {
 			return o.Requirements.Get(corev1.LabelTopologyZone).Any()
@@ -164,6 +168,9 @@ func computeCapacity(ctx context.Context, storageInGB int32,
 	}
 	if subeni != nil {
 		resourceList[corev1.ResourceName(api.TKELabelSubENI)] = *resources.Quantity(fmt.Sprint(lo.FromPtr(subeni)))
+	}
+	if instanceTypeInfo.Gpu > 0 {
+		resourceList[corev1.ResourceName(api.ResourceNVIDIAGPU)] = *resources.Quantity(fmt.Sprint(instanceTypeInfo.Gpu))
 	}
 	return resourceList
 }

@@ -41,7 +41,7 @@ type TKEMachineNodeClassSpec struct {
 	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['tags', 'id']",rule="self.all(x, has(x.tags) || has(x.id))"
 	// +kubebuilder:validation:XValidation:message="'id' is mutually exclusive, cannot be set with a combination of other fields in sshKeySelectorTerms",rule="!self.all(x, has(x.id) && has(x.tags))"
 	// +kubebuilder:validation:MaxItems:=30
-	// +required
+	// +optional
 	SSHKeySelectorTerms []SSHKeySelectorTerm `json:"sshKeySelectorTerms" hash:"ignore"`
 	// SystemDisk defines the system disk of the instance.
 	// if not specified, a default system disk (CloudPremium, 50GB) will be used.

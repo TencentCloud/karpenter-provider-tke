@@ -38,10 +38,6 @@ func (n Readiness) Reconcile(ctx context.Context, nodeClass *api.TKEMachineNodeC
 		nodeClass.StatusConditions().SetFalse(status.ConditionReady, "NodeClassNotReady", "Failed to resolve security groups")
 		return reconcile.Result{}, nil
 	}
-	if len(nodeClass.Status.SSHKeys) == 0 {
-		nodeClass.StatusConditions().SetFalse(status.ConditionReady, "NodeClassNotReady", "Failed to resolve ssh keys")
-		return reconcile.Result{}, nil
-	}
 	// A NodeClass that uses AL2023 requires the cluster CIDR for launching nodes.
 	// To allow Karpenter to be used for Non-EKS clusters, resolving the Cluster CIDR
 	// will not be done at startup but instead in a reconcile loop.

@@ -38,6 +38,8 @@ type InstanceTypeQuotaItem struct {
 	InstanceBandwidth float64         `json:"InstanceBandwidth"`
 	StorageBlock      uint64          `json:"StorageBlock,omitempty"       name:"StorageBlock"`
 	Price             ItemPrice       `json:"Price,omitempty"`
+	//  we will set it in the code
+	Arch string `json:"KarpenterArch,omitempty"`
 }
 
 type Externals struct {
