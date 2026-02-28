@@ -1,0 +1,31 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    metadata:
+      labels:
+        karpenter-test: "true"
+    spec:
+      expireAfter: Never
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["SA2.MEDIUM4"] # Request a specific instance type
+      nodeClassRef:
+        group: karpenter.k8s.tke
+        kind: TKEMachineNodeClass
+        name: default
+      taints:
+        - key: karpenter-test
+          value: "true"
+          effect: NoSchedule
+  limits:
+    cpu: "10"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s

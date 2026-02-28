@@ -35,9 +35,14 @@ vendor: ## update modules and populate local vendor directory
 	go mod verify
 
 .PHONY: image
-image: ## build and push the docker image
+image: karpenter-tke-controller ## build and push the docker image
 	docker build -t $(IMAGE):$(TAG) .
 	docker push $(IMAGE):$(TAG)
 
 .PHONY: release
 release: build image ## release
+
+.PHONY: integration-test
+integration-test: ## run integration tests
+	@bash test/integration/run-test.sh
+

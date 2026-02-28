@@ -68,12 +68,20 @@ Create the name of the service account to use
 Karpenter image to use
 */}}
 {{- define "karpenter.controller.image" -}}
+{{- if .Values.controller.image.useGlobalRegistry -}}
+    {{- if .Values.controller.image.digest -}}
+        {{- printf "%s:%s@%s" .Values.controller.image.repository (default (printf "v%s" .Chart.AppVersion) .Values.controller.image.tag) .Values.controller.image.digest -}}
+    {{- else -}}
+        {{- printf "%s:%s" .Values.controller.image.repository (default (printf "v%s" .Chart.AppVersion) .Values.controller.image.tag) -}}
+    {{- end -}}
+{{- else -}}
 {{- $regionMap := dict "ap-hongkong" "hk" "na-toronto" "ca" "ap-beijing-fsi" "bjjr" "ap-taipei" "tpe" "ap-tokyo" "jp" "ap-bangkok" "th" "na-ashburn" "use" "ap-seoul" "kr" "ap-mumbai" "in" "ap-shanghai-fsi" "shjr" "eu-frankfurt" "de" "ap-singapore" "sg" "na-siliconvalley" "usw" "ap-shenzhen-fsi" "szjr" "ap-jakarta" "jkt" "sa-saopaulo" "sao" "ap-shanghai-adc" "shadc" "ap-guangzhou-wxzf" "gzwxzf" "ap-shanghai-wxzf" "shwxzf" "ap-shenzhen-jxcft" "szjxcft" }}
-{{- if .Values.controller.image.digest }}
-{{- printf "%s%s:%s@%s" (get $regionMap (printf "%s" .Values.settings.region )) .Values.controller.image.repository  (default (printf "v%s" .Chart.AppVersion) .Values.controller.image.tag) .Values.controller.image.digest }}
-{{- else }}
-{{- printf "%s%s:%s" (get $regionMap (printf "%s" .Values.settings.region )) .Values.controller.image.repository  (default (printf "v%s" .Chart.AppVersion) .Values.controller.image.tag) }}
-{{- end }}
+{{- if .Values.controller.image.digest -}}
+{{- printf "%s%s:%s@%s" (get $regionMap (printf "%s" .Values.settings.region )) .Values.controller.image.repository  (default (printf "v%s" .Chart.AppVersion) .Values.controller.image.tag) .Values.controller.image.digest -}}
+{{- else -}}
+{{- printf "%s%s:%s" (get $regionMap (printf "%s" .Values.settings.region )) .Values.controller.image.repository  (default (printf "v%s" .Chart.AppVersion) .Values.controller.image.tag) -}}
+{{- end -}}
+{{- end -}}
 {{- end }}
 
 

@@ -8,6 +8,8 @@
 *.so
 *.dylib
 bin
+env
+secret
 
 # Test binary, built with `go test -c`
 *.test
