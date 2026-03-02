@@ -27,11 +27,11 @@ log_fail() {
 }
 
 run_kubectl() {
-    http_proxy="" https_proxy="" kubectl --kubeconfig="${KUBECONFIG_PATH}" "$@"
+    http_proxy="" https_proxy="" kubectl "$@"
 }
 
 run_helm() {
-    http_proxy="" https_proxy="" helm --kubeconfig="${KUBECONFIG_PATH}" "$@"
+    http_proxy="" https_proxy="" helm "$@"
 }
 
 # --- Core Setup and Teardown Functions ---
@@ -165,7 +165,14 @@ discover_and_setup_environment() {
 
     SECURITY_GROUP_ID=$(echo "${instance_details}" | jq -r '.InstanceSet[0].SecurityGroupIds[0]')
     SSH_KEY_ID=$(tccli cvm DescribeKeyPairs --output json | jq -r '.KeyPairSet[0].KeyId')
-    CLUSTER_NAME=$(run_kubectl config view -o jsonpath='{.clusters[0].name}')
+    # Extract the real cluster ID from the server URL (e.g. https://cls-xxxx.xxx.tke.woa.com)
+    local server_url
+    server_url=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
+    CLUSTER_NAME=$(echo "${server_url}" | grep -oE 'cls-[a-z0-9]+')
+    if [ -z "${CLUSTER_NAME}" ]; then
+        log_fail "Could not extract cluster ID from server URL: ${server_url}"
+    fi
+    log_info "Cluster ID: ${CLUSTER_NAME}"
 
     # Derive the zone ID for the zone constraint test (uses same zone as the cluster)
     ZONE_ID=$(tccli cvm DescribeZones --output json | jq -r --arg z "${zone}" '.ZoneSet[] | select(.Zone == $z) | .ZoneId')
@@ -253,6 +260,8 @@ cleanup_test_resources() {
         rm -f test/integration/nodepool-zone.yaml
     fi
     run_kubectl delete --ignore-not-found -f test/integration/nodepool-expiry.yaml
+    run_kubectl delete --ignore-not-found -f test/integration/nodepool-fallback-invalid.yaml
+    run_kubectl delete --ignore-not-found -f test/integration/nodepool-fallback-valid.yaml
     if [ -f test/integration/tkemachinenodeclass.yaml ]; then
         run_kubectl delete --ignore-not-found -f test/integration/tkemachinenodeclass.yaml
         rm -f test/integration/tkemachinenodeclass.yaml
@@ -350,7 +359,7 @@ wait_for_node_ready() {
     local node_name=""
     log_info "Waiting for new node to become Ready..."
     for (( i=1; i<=max_attempts; i++ )); do
-        node_name=$(run_kubectl get nodes -l karpenter.sh/nodepool -o json | jq -r '.items[] | select(.status.conditions[] | select(.type == "Ready" and .status == "True")) | .metadata.name' 2>/dev/null)
+        node_name=$(run_kubectl get nodes -l karpenter.sh/nodepool -o json | jq -r '.items[] | select(.status.conditions[] | select(.type == "Ready" and .status == "True")) | .metadata.name' 2>/dev/null | head -1)
         if [ -n "${node_name}" ]; then
             log_info "New node ${node_name} is Ready."
             echo "${node_name}"
@@ -516,6 +525,40 @@ test_expiry() {
     log_pass "--- PASSED: test_expiry ---"
 }
 
+test_multi_nodepool_fallback() {
+    log_info "--- RUNNING: test_multi_nodepool_fallback ---"
+    log_info "Scenario: two NodePools coexist - one with an invalid instance type, one valid."
+    log_info "Expectation: the invalid NodePool does not block scale-up via the valid NodePool."
+
+    generate_valid_nodeclass
+    run_kubectl apply -f test/integration/tkemachinenodeclass.yaml
+    # Apply both NodePools simultaneously
+    run_kubectl apply -f test/integration/nodepool-fallback-invalid.yaml
+    run_kubectl apply -f test/integration/nodepool-fallback-valid.yaml
+    run_kubectl apply -f test/integration/deployment.yaml
+
+    log_info "Scaling deployment to trigger scale-up..."
+    run_kubectl scale deployment inflate --replicas=2
+
+    local new_node_name
+    new_node_name=$(wait_for_node_ready 60)
+
+    log_info "Verifying node was provisioned by the valid NodePool..."
+    local node_pool_label
+    node_pool_label=$(run_kubectl get node "${new_node_name}" -o jsonpath='{.metadata.labels.karpenter\.sh/nodepool}')
+
+    if [ "${node_pool_label}" != "fallback-valid" ]; then
+        log_fail "Expected node to be created by 'fallback-valid' NodePool, but got '${node_pool_label}'."
+    fi
+    log_info "Node ${new_node_name} was correctly provisioned by NodePool '${node_pool_label}'."
+
+    run_kubectl scale deployment inflate --replicas=0
+    wait_for_node_deleted "${new_node_name}" 60
+
+    cleanup_test_resources
+    log_pass "--- PASSED: test_multi_nodepool_fallback ---"
+}
+
 # --- Main Execution ---
 
 main() {
@@ -532,6 +575,7 @@ main() {
     test_instance_type_constraint
     test_zone_constraint
     test_expiry
+    test_multi_nodepool_fallback
 
     log_pass "All integration tests completed successfully!"
 }
