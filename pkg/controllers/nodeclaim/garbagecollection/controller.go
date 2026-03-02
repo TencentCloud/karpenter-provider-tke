@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/awslabs/operatorpkg/reconciler"
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/samber/lo"
 	api "github.com/tencentcloud/karpenter-provider-tke/pkg/apis/v1beta1"
@@ -33,7 +34,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -53,7 +53,7 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 	}
 }
 
-func (c *Controller) Reconcile(ctx context.Context) (reconcile.Result, error) {
+func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, "machine.garbagecollection")
 
 	// We LIST machines on the CloudProvider BEFORE we grab Machines/Nodes on the cluster so that we make sure that, if
@@ -61,18 +61,18 @@ func (c *Controller) Reconcile(ctx context.Context) (reconcile.Result, error) {
 	// This works since our CloudProvider instances are deleted based on whether the Machine exists or not, not vise-versa
 	retrieved, err := c.cloudProvider.List(ctx)
 	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("listing cloudprovider machines, %w", err)
+		return reconciler.Result{}, fmt.Errorf("listing cloudprovider machines, %w", err)
 	}
 	managedRetrieved := lo.Filter(retrieved, func(nc *v1.NodeClaim, _ int) bool {
 		return nc.Annotations[api.AnnotationManagedBy] != "" && nc.DeletionTimestamp.IsZero()
 	})
 	nodeClaimList := &v1.NodeClaimList{}
 	if err = c.kubeClient.List(ctx, nodeClaimList); err != nil {
-		return reconcile.Result{}, err
+		return reconciler.Result{}, err
 	}
 	machineList := &capiv1beta1.MachineList{}
 	if err = c.kubeClient.List(ctx, machineList); err != nil {
-		return reconcile.Result{}, err
+		return reconciler.Result{}, err
 	}
 	resolvedOwnedMachines := sets.New(lo.FilterMap(nodeClaimList.Items, func(n v1.NodeClaim, _ int) (string, bool) {
 		return n.Annotations[api.AnnotationOwnedMachine], n.Annotations[api.AnnotationOwnedMachine] != ""
@@ -85,10 +85,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconcile.Result, error) {
 		}
 	})
 	if err = multierr.Combine(errs...); err != nil {
-		return reconcile.Result{}, err
+		return reconciler.Result{}, err
 	}
 	c.successfulCount++
-	return reconcile.Result{RequeueAfter: lo.Ternary(c.successfulCount <= 20, time.Second*10, time.Minute)}, nil
+	return reconciler.Result{RequeueAfter: lo.Ternary(c.successfulCount <= 20, time.Second*10, time.Minute)}, nil
 }
 
 func (c *Controller) garbageCollect(ctx context.Context, nodeClaim *v1.NodeClaim, machineList *capiv1beta1.MachineList) error {

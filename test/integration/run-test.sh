@@ -53,9 +53,24 @@ setup_dependencies() {
 
 discover_and_setup_environment() {
     log_info "Discovering environment variables and cloud provider info..."
-    export KUBECONFIG_PATH
-    KUBECONFIG_PATH=$(grep 'export KUBECONFIG=' ./env | cut -d'=' -f2-)
-    REGISTRY=$(grep 'export REGISTRY=' ./env | cut -d'=' -f2-)
+    
+    if [ -f "./env" ]; then
+        source ./env
+    else
+        log_fail "./env file not found"
+    fi
+
+    if [ -z "${KUBECONFIG}" ]; then
+         log_fail "KUBECONFIG not set in ./env"
+    fi
+    export KUBECONFIG_PATH="${KUBECONFIG}"
+    log_info "Using KUBECONFIG: ${KUBECONFIG_PATH}"
+    
+    # Verify kubectl connectivity immediately
+    if ! run_kubectl get nodes > /dev/null; then
+        log_fail "kubectl failed to connect to cluster using ${KUBECONFIG_PATH}"
+    fi
+
     export TENCENT_CLOUD_SECRET_ID=$(awk -F: '/SecretId/ {print $2}' ./secret)
     export TENCENT_CLOUD_SECRET_KEY=$(awk -F: '/SecretKey/ {print $2}' ./secret)
     export IMAGE_TAG="test-$(date +%s)"
@@ -63,20 +78,78 @@ discover_and_setup_environment() {
     local node_name instance_id filters instance_details vpc_id
     local zone
     node_name=$(run_kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+    log_info "Node name: '${node_name}'"
+    
+    if [ -z "${node_name}" ]; then
+         log_fail "Failed to get node name"
+    fi
+
     instance_id=$(run_kubectl get node "${node_name}" -o jsonpath='{.metadata.labels.cloud\.tencent\.com/node-instance-id}')
+    log_info "Instance ID: '${instance_id}'"
+
+    if [ -z "${instance_id}" ]; then
+         log_fail "Failed to get instance ID from node '${node_name}'"
+    fi
+
+    local node_region
+    node_region=$(run_kubectl get node "${node_name}" -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/region}')
+    log_info "Node Region: ${node_region}"
+
+    local region_map
+    case "${node_region}" in
+        "cd") region_map="ap-chengdu" ;;
+        "gz") region_map="ap-guangzhou" ;;
+        "bj") region_map="ap-beijing" ;;
+        "sh") region_map="ap-shanghai" ;;
+        "cq") region_map="ap-chongqing" ;;
+        "hk") region_map="ap-hongkong" ;;
+        "sg") region_map="ap-singapore" ;;
+        *) region_map="${node_region}" ;;
+    esac
+    log_info "Mapping region '${node_region}' to '${region_map}'"
+    tccli configure set region "${region_map}"
+
     filters='[{"Name":"instance-id", "Values":["'${instance_id}'"]}]'
+    log_info "Using filters: ${filters}"
+
     instance_details=$(tccli cvm DescribeInstances --Filters "${filters}" --output json)
+    # Log first 100 chars of instance_details to check if it worked
+    log_info "Instance details (truncated): $(echo "${instance_details}" | head -c 100)"
 
     REGION=$(echo "${instance_details}" | jq -r '.InstanceSet[0].Placement.Zone' | sed 's/-\([0-9]\)$//g')
     vpc_id=$(echo "${instance_details}" | jq -r '.InstanceSet[0].VirtualPrivateCloud.VpcId')
     zone=$(echo "${instance_details}" | jq -r '.InstanceSet[0].Placement.Zone')
 
+    log_info "Discovered Region: ${REGION}, VPC: ${vpc_id}, Zone: ${zone}"
+
+    if [ -z "${vpc_id}" ] || [ "${vpc_id}" == "null" ]; then
+        log_fail "Failed to discover VPC ID. tccli output might be empty or invalid."
+    fi
+
     # Create a new subnet for this test run to avoid IP exhaustion.
     # Use a unique CIDR derived from the timestamp to avoid conflicts across parallel runs.
-    # The timestamp (seconds) is used to generate a unique third octet in 172.16.x.0/24 range.
+    # Get VPC CIDR to determine valid subnet range
+    local vpc_details
+    vpc_details=$(tccli vpc DescribeVpcs --VpcIds "[\"${vpc_id}\"]" --output json)
+    local vpc_cidr
+    vpc_cidr=$(echo "${vpc_details}" | jq -r '.VpcSet[0].CidrBlock')
+    log_info "VPC CIDR: ${vpc_cidr}"
+
+    if [ -z "${vpc_cidr}" ] || [ "${vpc_cidr}" == "null" ]; then
+        log_fail "Failed to get VPC CIDR."
+    fi
+
+    local vpc_prefix=$(echo "${vpc_cidr}" | cut -d'/' -f1)
+    # Extract first two octets
+    local octet1=$(echo "${vpc_prefix}" | cut -d'.' -f1)
+    local octet2=$(echo "${vpc_prefix}" | cut -d'.' -f2)
+    
+    # Generate a random 3rd octet to avoid conflicts
+    local random_octet=$(( ($(date +%s) % 150) + 50 ))
+    local new_subnet_cidr="${octet1}.${octet2}.${random_octet}.0/24"
+    log_info "Generated Subnet CIDR: ${new_subnet_cidr}"
+
     local new_subnet_name="karpenter-test-subnet-${IMAGE_TAG}"
-    local ts_octet=$(( ($(date +%s) % 200) + 50 ))  # range 50-249, avoids common CIDRs
-    local new_subnet_cidr="172.16.${ts_octet}.0/24"
     log_info "Creating a new subnet '${new_subnet_name}' with CIDR ${new_subnet_cidr} in VPC ${vpc_id} and Zone ${zone}..."
     local create_subnet_result
     create_subnet_result=$(tccli vpc CreateSubnet --VpcId "${vpc_id}" --SubnetName "${new_subnet_name}" --CidrBlock "${new_subnet_cidr}" --Zone "${zone}" --output json)

@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/awslabs/operatorpkg/reconciler"
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/samber/lo"
 	api "github.com/tencentcloud/karpenter-provider-tke/pkg/apis/v1beta1"
@@ -35,7 +36,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 )
@@ -54,12 +54,12 @@ func NewController(kubeClient client.Client, instancetypeProvider instancetype.P
 	}
 }
 
-func (c *Controller) Reconcile(ctx context.Context) (reconcile.Result, error) {
+func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, "nodeclaim.failure")
 
 	machineList := &capiv1beta1.MachineList{}
 	if err := c.kubeClient.List(ctx, machineList); err != nil {
-		return reconcile.Result{}, err
+		return reconciler.Result{}, err
 	}
 	insufficientMachines := lo.Filter(machineList.Items, func(m capiv1beta1.Machine, _ int) bool {
 		return lo.FromPtr(m.Spec.ProviderID) == "" && lo.ContainsBy(m.GetOwnerReferences(), func(ref metav1.OwnerReference) bool { return ref.Kind == "NodeClaim" }) &&
@@ -79,10 +79,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconcile.Result, error) {
 		errs[i] = c.deleteFailureMachine(ctx, failureMachines[i])
 	})
 	if err := multierr.Combine(errs...); err != nil {
-		return reconcile.Result{}, err
+		return reconciler.Result{}, err
 	}
 	c.successfulCount++
-	return reconcile.Result{RequeueAfter: lo.Ternary(c.successfulCount <= 20, time.Second*10, time.Minute)}, nil
+	return reconciler.Result{RequeueAfter: lo.Ternary(c.successfulCount <= 20, time.Second*10, time.Minute)}, nil
 }
 
 func (c *Controller) refreshInstanceTypes(ctx context.Context, insufficientMachines []capiv1beta1.Machine) {

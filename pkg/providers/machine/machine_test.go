@@ -30,9 +30,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
@@ -179,19 +181,15 @@ func createDefaultNodeClaim() *v1.NodeClaim {
 		Spec: v1.NodeClaimSpec{
 			Requirements: []v1.NodeSelectorRequirementWithMinValues{
 				{
-					NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+					
 						Key:      corev1.LabelTopologyZone,
 						Operator: corev1.NodeSelectorOpIn,
-						Values:   []string{"ap-guangzhou-1"},
-					},
-				},
+						Values:   []string{"ap-guangzhou-1"},},
 				{
-					NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+					
 						Key:      v1.CapacityTypeLabelKey,
 						Operator: corev1.NodeSelectorOpIn,
-						Values:   []string{v1.CapacityTypeOnDemand},
-					},
-				},
+						Values:   []string{v1.CapacityTypeOnDemand},},
 			},
 			Resources: v1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -292,6 +290,19 @@ func (c *simpleFakeClient) GroupVersionKindFor(obj runtime.Object) (schema.Group
 
 func (c *simpleFakeClient) IsObjectNamespaced(obj runtime.Object) (bool, error) {
 	return true, nil
+}
+
+// Implement missing SubResource method to satisfy client.Client interface
+func (c *simpleFakeClient) SubResourceClient(subResource string) client.SubResourceClient {
+	return &simpleSubResourceClient{client: c}
+}
+
+func (c *simpleFakeClient) Watch(ctx context.Context, list client.ObjectList, opts ...client.ListOption) (watch.Interface, error) {
+	return nil, fmt.Errorf("watch not implemented")
+}
+
+func (c *simpleFakeClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+	return nil
 }
 
 type simpleStatusWriter struct {
@@ -569,12 +580,10 @@ func TestCreate_DifferentCapacityTypes(t *testing.T) {
 			nodeClaim := createDefaultNodeClaim()
 			nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 				{
-					NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+					
 						Key:      v1.CapacityTypeLabelKey,
 						Operator: corev1.NodeSelectorOpIn,
-						Values:   []string{tt.capacityType},
-					},
-				},
+						Values:   []string{tt.capacityType},},
 			}
 
 			instanceTypes := []*cloudprovider.InstanceType{
@@ -788,16 +797,12 @@ func TestCreate_EmptyInstanceTypes(t *testing.T) {
 
 	provider := NewDefaultProvider(ctx, fakeClient, mockZoneProvider, "test-cluster")
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("Expected panic for empty instance types, but no panic occurred")
-		}
-	}()
-
 	machine, providerSpec, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
 
 	if err == nil {
-		t.Error("Expected error or panic, got nil error")
+		t.Error("Expected error, got nil")
+	} else if err.Error() != "no instance types available" {
+		t.Errorf("Expected error 'no instance types available', but got '%v'", err)
 	}
 
 	if machine != nil {
@@ -1786,12 +1791,10 @@ func TestIsMixedCapacityLaunch_True(t *testing.T) {
 	// Create nodeClaim with both spot and on-demand requirements
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      v1.CapacityTypeLabelKey,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand},
-			},
-		},
+				Values:   []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand},},
 	}
 
 	// Create instance types with both spot and on-demand offerings
@@ -1820,12 +1823,10 @@ func TestIsMixedCapacityLaunch_False_OnlySpot(t *testing.T) {
 	// Create nodeClaim with only spot requirement
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      v1.CapacityTypeLabelKey,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{v1.CapacityTypeSpot},
-			},
-		},
+				Values:   []string{v1.CapacityTypeSpot},},
 	}
 
 	spotInstance := createInstanceType("S3.MEDIUM4", 4, 8, 0.3, "ap-guangzhou-1", v1.CapacityTypeSpot)
@@ -1851,12 +1852,10 @@ func TestIsMixedCapacityLaunch_False_OnlyOnDemand(t *testing.T) {
 	// Create nodeClaim with only on-demand requirement
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      v1.CapacityTypeLabelKey,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{v1.CapacityTypeOnDemand},
-			},
-		},
+				Values:   []string{v1.CapacityTypeOnDemand},},
 	}
 
 	onDemandInstance := createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand)
@@ -1922,7 +1921,7 @@ func TestFilterUnwantedSpot_KeepsAllWhenSpotCheaper(t *testing.T) {
 // Test Create with minValues in requirements
 func TestCreate_WithMinValues(t *testing.T) {
 	scheme := createScheme()
-	ctx := context.Background()
+	ctx := options.ToContext(context.Background(), &options.Options{})
 
 	nodeClass := createDefaultNodeClass()
 	nodeClaim := createDefaultNodeClaim()
@@ -1930,11 +1929,9 @@ func TestCreate_WithMinValues(t *testing.T) {
 	// Add minValues to requirements
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-				Key:      v1.CapacityTypeLabelKey,
-				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{v1.CapacityTypeOnDemand},
-			},
+			Key:       v1.CapacityTypeLabelKey,
+			Operator:  corev1.NodeSelectorOpIn,
+			Values:    []string{v1.CapacityTypeOnDemand},
 			MinValues: lo.ToPtr(1),
 		},
 	}
@@ -1973,12 +1970,10 @@ func TestFilterInstanceTypes_MixedCapacity(t *testing.T) {
 	// Create nodeClaim with both spot and on-demand requirements
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      v1.CapacityTypeLabelKey,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand},
-			},
-		},
+				Values:   []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand},},
 	}
 
 	// Create instance types with both spot and on-demand offerings
@@ -2449,12 +2444,10 @@ func TestCreate_ARMArchitecture(t *testing.T) {
 	// Add ARM architecture requirement
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      corev1.LabelArchStable,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{"arm64"},
-			},
-		},
+				Values:   []string{"arm64"},},
 	}
 
 	instanceTypes := []*cloudprovider.InstanceType{
@@ -2508,12 +2501,10 @@ func TestCreate_MultipleARMInstanceTypes(t *testing.T) {
 	// Add ARM architecture requirement
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      corev1.LabelArchStable,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{"arm64"},
-			},
-		},
+				Values:   []string{"arm64"},},
 	}
 
 	instanceTypes := []*cloudprovider.InstanceType{
@@ -2554,12 +2545,10 @@ func TestCreate_MixedArchitectures(t *testing.T) {
 	// Allow both architectures
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      corev1.LabelArchStable,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{"amd64", "arm64"},
-			},
-		},
+				Values:   []string{"amd64", "arm64"},},
 	}
 
 	instanceTypes := []*cloudprovider.InstanceType{
@@ -2600,19 +2589,15 @@ func TestCreate_ARMSpotInstances(t *testing.T) {
 	// Add ARM architecture and Spot capacity type requirements
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      corev1.LabelArchStable,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{"arm64"},
-			},
-		},
+				Values:   []string{"arm64"},},
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      v1.CapacityTypeLabelKey,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{v1.CapacityTypeSpot},
-			},
-		},
+				Values:   []string{v1.CapacityTypeSpot},},
 	}
 
 	instanceTypes := []*cloudprovider.InstanceType{
@@ -2678,19 +2663,15 @@ func TestCreate_ARMDifferentCapacityTypes(t *testing.T) {
 			nodeClaim := createDefaultNodeClaim()
 			nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 				{
-					NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+					
 						Key:      corev1.LabelArchStable,
 						Operator: corev1.NodeSelectorOpIn,
-						Values:   []string{"arm64"},
-					},
-				},
+						Values:   []string{"arm64"},},
 				{
-					NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+					
 						Key:      v1.CapacityTypeLabelKey,
 						Operator: corev1.NodeSelectorOpIn,
-						Values:   []string{tt.capacityType},
-					},
-				},
+						Values:   []string{tt.capacityType},},
 			}
 
 			instanceTypes := []*cloudprovider.InstanceType{
@@ -2738,12 +2719,10 @@ func TestCreate_ARMResourceBoundaryValues(t *testing.T) {
 	// Add ARM architecture requirement
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      corev1.LabelArchStable,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{"arm64"},
-			},
-		},
+				Values:   []string{"arm64"},},
 	}
 
 	instanceTypes := []*cloudprovider.InstanceType{
@@ -2795,19 +2774,15 @@ func TestCreate_ARMWithResourceRequirements(t *testing.T) {
 	// Add ARM architecture and resource requirements
 	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      corev1.LabelArchStable,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{"arm64"},
-			},
-		},
+				Values:   []string{"arm64"},},
 		{
-			NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+			
 				Key:      api.LabelInstanceCPU,
 				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{"8", "16"},
-			},
-		},
+				Values:   []string{"8", "16"},},
 	}
 
 	instanceTypes := []*cloudprovider.InstanceType{

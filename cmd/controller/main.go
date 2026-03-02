@@ -22,6 +22,7 @@ import (
 	"github.com/tencentcloud/karpenter-provider-tke/pkg/operator"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/metrics"
 	kcontrollers "sigs.k8s.io/karpenter/pkg/controllers"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	koreoperator "sigs.k8s.io/karpenter/pkg/operator"
 )
@@ -29,9 +30,12 @@ import (
 func main() {
 	ctx, op := operator.NewOperator(koreoperator.NewOperator())
 
-	cloudProvider := metrics.Decorate(cloudprovider.NewCloudProvider(ctx, op.GetClient(), op.MachineProvider,
-		op.InstanceTypeProvider, op.ZoneProvider))
+	undecoratedCloudProvider := cloudprovider.NewCloudProvider(ctx, op.GetClient(), op.MachineProvider,
+		op.InstanceTypeProvider, op.ZoneProvider)
+	cloudProvider := metrics.Decorate(undecoratedCloudProvider)
 	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider)
+	instanceTypeStore := nodeoverlay.NewInstanceTypeStore()
+
 	op.
 		WithControllers(ctx, kcontrollers.NewControllers(
 			ctx,
@@ -40,7 +44,9 @@ func main() {
 			op.GetClient(),
 			op.EventRecorder,
 			cloudProvider,
+			undecoratedCloudProvider,
 			clusterState,
+			instanceTypeStore,
 		)...).
 		WithControllers(ctx, controllers.NewControllers(
 			ctx,

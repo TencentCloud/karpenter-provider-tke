@@ -114,9 +114,13 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 	if !schedulingRequirements.HasMinValues() {
 		instanceTypes = p.filterInstanceTypes(nodeClaim, instanceTypes)
 	}
-	instanceTypes, err := cloudprovider.InstanceTypes(instanceTypes).Truncate(schedulingRequirements, maxInstanceTypes)
+	instanceTypes, err := cloudprovider.InstanceTypes(instanceTypes).Truncate(ctx, schedulingRequirements, maxInstanceTypes)
 	if err != nil {
 		return nil, nil, fmt.Errorf("truncating instance types, %w", err)
+	}
+
+	if len(instanceTypes) == 0 {
+		return nil, nil, fmt.Errorf("no instance types available")
 	}
 
 	instanceTypes = orderInstanceTypesByPrice(instanceTypes, schedulingRequirements)
@@ -139,16 +143,31 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 
 	machine := &capiv1beta1.Machine{}
 	providerSpec := &capiv1beta1.CXMMachineProviderSpec{}
-	machine.SetLabels(map[string]string{
-		v1.NodePoolLabelKey:       nodeClaim.GetLabels()[v1.NodePoolLabelKey],
-		api.LabelNodeClaim:        nodeClaim.Name,
-		api.LabelNodeClass:        nodeClass.Name,
-		api.LabelInstanceFamily:   instanceTypes[0].Requirements.Get(api.LabelInstanceFamily).Values()[0],
-		api.LabelInstanceCPU:      instanceTypes[0].Requirements.Get(api.LabelInstanceCPU).Values()[0],
-		api.LabelInstanceMemoryGB: instanceTypes[0].Requirements.Get(api.LabelInstanceMemoryGB).Values()[0],
-		corev1.LabelArchStable:    instanceTypes[0].Requirements.Get(corev1.LabelArchStable).Values()[0],
-		v1.CapacityTypeLabelKey:   instanceTypes[0].Offerings.Available().Compatible(schedulingRequirements).Cheapest().Requirements.Get(v1.CapacityTypeLabelKey).Any(),
-	})
+	labels := map[string]string{
+		v1.NodePoolLabelKey: nodeClaim.GetLabels()[v1.NodePoolLabelKey],
+		api.LabelNodeClaim:  nodeClaim.Name,
+		api.LabelNodeClass:  nodeClass.Name,
+	}
+
+	if instanceTypes[0].Requirements.Get(api.LabelInstanceFamily).Len() > 0 {
+		labels[api.LabelInstanceFamily] = instanceTypes[0].Requirements.Get(api.LabelInstanceFamily).Values()[0]
+	}
+	if instanceTypes[0].Requirements.Get(api.LabelInstanceCPU).Len() > 0 {
+		labels[api.LabelInstanceCPU] = instanceTypes[0].Requirements.Get(api.LabelInstanceCPU).Values()[0]
+	}
+	if instanceTypes[0].Requirements.Get(api.LabelInstanceMemoryGB).Len() > 0 {
+		labels[api.LabelInstanceMemoryGB] = instanceTypes[0].Requirements.Get(api.LabelInstanceMemoryGB).Values()[0]
+	}
+	if vals := instanceTypes[0].Requirements.Get(corev1.LabelArchStable).Values(); len(vals) > 0 {
+		labels[corev1.LabelArchStable] = vals[0]
+	}
+	
+	cheapestOffering := instanceTypes[0].Offerings.Available().Compatible(schedulingRequirements).Cheapest()
+	if cheapestOffering != nil && cheapestOffering.Requirements.Get(v1.CapacityTypeLabelKey).Len() > 0 {
+		labels[v1.CapacityTypeLabelKey] = cheapestOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any()
+	}
+
+	machine.SetLabels(labels)
 	//TODO may be conflict with existed machineset
 	machine.GenerateName = fmt.Sprintf("np-%s-", utilrand.String(8))
 	machine.Spec.DisplayName = nodeClaim.Name

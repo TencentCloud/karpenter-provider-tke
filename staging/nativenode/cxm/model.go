@@ -33,40 +33,40 @@ type InstanceTypeQuotaItem struct {
 	Status            string          `json:"Status"`
 	Remark            string          `json:"Remark"`
 	Externals         Externals       `json:"Externals"`
-	LocalDiskTypeList []LocalDiskType `json:"LocalDiskTypeList,omitempty"  name:"LocalDiskTypeList"`
-	TypeName          string          `json:"TypeName,omitempty"           name:"TypeName"`
+	LocalDiskTypeList []LocalDiskType `json:"LocalDiskTypeList,omitempty" name:"LocalDiskTypeList"`
+	TypeName          string          `json:"TypeName,omitempty" name:"TypeName"`
 	InstanceBandwidth float64         `json:"InstanceBandwidth"`
-	StorageBlock      uint64          `json:"StorageBlock,omitempty"       name:"StorageBlock"`
+	StorageBlock      uint64          `json:"StorageBlock,omitempty" name:"StorageBlock"`
 	Price             ItemPrice       `json:"Price,omitempty"`
 	//  we will set it in the code
 	Arch string `json:"KarpenterArch,omitempty"`
 }
 
 type Externals struct {
-	ReleaseAddress           *bool        `json:"ReleaseAddress,omitempty"    name:"ReleaseAddress"`
+	ReleaseAddress           *bool        `json:"ReleaseAddress,omitempty" name:"ReleaseAddress"`
 	GpuAttr                  GpuAttr      `json:"GpuAttr"`
 	GPUDesc                  string       `json:"GPUDesc"`
 	UnsupportNetworks        []string     `json:"UnsupportNetworks,omitempty" name:"UnsupportNetworks"`
-	StorageBlockAttr         StorageBlock `json:"StorageBlockAttr,omitempty"  name:"StorageBlockAttr"`
+	StorageBlockAttr         StorageBlock `json:"StorageBlockAttr,omitempty" name:"StorageBlockAttr"`
 	PrepaidUnderwriteEnable  bool         `json:"prepaid_underwrite_enable,omitempty"`
 	PrepaidUnderwritePeriods []int        `json:"prepaid_underwrite_periods,omitempty"`
 }
 
 type LocalDiskType struct {
-	Type          string `json:"Type,omitempty"          name:"Type"`
+	Type          string `json:"Type,omitempty" name:"Type"`
 	PartitionType string `json:"PartitionType,omitempty" name:"PartitionType"`
-	MinSize       int64  `json:"MinSize,omitempty"       name:"MinSize"`
-	MaxSize       int64  `json:"MaxSize,omitempty"       name:"MaxSize"`
+	MinSize       int64  `json:"MinSize,omitempty" name:"MinSize"`
+	MaxSize       int64  `json:"MaxSize,omitempty" name:"MaxSize"`
 }
 
 type ItemPrice struct {
-	UnitPrice     float64  `json:"UnitPrice,omitempty"		name:"UnitPrice"`
-	OriginalPrice float64  `json:"OriginalPrice,omitempty"	name:"OriginalPrice"`
-	SpotpaidPrice *float64 `json:"SpotpaidPrice,omitempty"	name:"SpotpaidPrice"`
+	UnitPrice     float64  `json:"UnitPrice,omitempty" name:"UnitPrice"`
+	OriginalPrice float64  `json:"OriginalPrice,omitempty" name:"OriginalPrice"`
+	SpotpaidPrice *float64 `json:"SpotpaidPrice,omitempty" name:"SpotpaidPrice"`
 }
 
 type StorageBlock struct {
-	Type    string `json:"Type,omitempty"    name:"Type"`
+	Type    string `json:"Type,omitempty" name:"Type"`
 	MinSize int64  `json:"MinSize,omitempty" name:"MinSize"`
 	MaxSize int64  `json:"MaxSize,omitempty" name:"MaxSize"`
 }
