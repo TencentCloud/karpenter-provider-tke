@@ -18,6 +18,7 @@ package machine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -201,7 +202,7 @@ func createDefaultNodeClaim() *v1.NodeClaim {
 	}
 }
 
-func createFakeClient(scheme *runtime.Scheme, objects ...client.Object) client.Client {
+func createFakeClient(scheme *runtime.Scheme, objects ...client.Object) *simpleFakeClient {
 	return &simpleFakeClient{
 		objects: objects,
 		scheme:  scheme,
@@ -209,8 +210,11 @@ func createFakeClient(scheme *runtime.Scheme, objects ...client.Object) client.C
 }
 
 type simpleFakeClient struct {
-	objects []client.Object
-	scheme  *runtime.Scheme
+	objects   []client.Object
+	scheme    *runtime.Scheme
+	listErr   error
+	createErr error
+	deleteErr error
 }
 
 func (c *simpleFakeClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -223,6 +227,9 @@ func (c *simpleFakeClient) Get(ctx context.Context, key client.ObjectKey, obj cl
 }
 
 func (c *simpleFakeClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if c.listErr != nil {
+		return c.listErr
+	}
 	// Handle MachineList
 	if machineList, ok := list.(*capiv1beta1.MachineList); ok {
 		machineList.Items = []capiv1beta1.Machine{}
@@ -236,11 +243,17 @@ func (c *simpleFakeClient) List(ctx context.Context, list client.ObjectList, opt
 }
 
 func (c *simpleFakeClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if c.createErr != nil {
+		return c.createErr
+	}
 	c.objects = append(c.objects, obj)
 	return nil
 }
 
 func (c *simpleFakeClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if c.deleteErr != nil {
+		return c.deleteErr
+	}
 	// Remove the object from the list
 	newObjects := []client.Object{}
 	for _, o := range c.objects {
@@ -2813,5 +2826,811 @@ func TestCreate_ARMWithResourceRequirements(t *testing.T) {
 
 	if machine.Labels[corev1.LabelArchStable] != "arm64" {
 		t.Errorf("Expected architecture label arm64, got %s", machine.Labels[corev1.LabelArchStable])
+	}
+}
+
+// ====== New error path tests ======
+
+func TestGet_ListError(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	fakeClient := createFakeClient(scheme)
+	fakeClient.listErr = fmt.Errorf("list error")
+
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, err := provider.Get(ctx, "some-provider-id")
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if !contains(err.Error(), "unable to list machines") {
+		t.Errorf("Expected error containing 'unable to list machines', got %q", err.Error())
+	}
+}
+
+func TestList_ListError(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	fakeClient := createFakeClient(scheme)
+	fakeClient.listErr = fmt.Errorf("list error")
+
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, err := provider.List(ctx)
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if !contains(err.Error(), "list error") {
+		t.Errorf("Expected error containing 'list error', got %q", err.Error())
+	}
+}
+
+func TestDelete_GetReturnsUnexpectedError(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	fakeClient := createFakeClient(scheme)
+	fakeClient.listErr = fmt.Errorf("unexpected list error")
+
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	nodeClaim := createDefaultNodeClaim()
+	nodeClaim.Status.ProviderID = "some-provider-id"
+
+	err := provider.Delete(ctx, nodeClaim)
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if !contains(err.Error(), "unexpected list error") {
+		t.Errorf("Expected error containing 'unexpected list error', got %q", err.Error())
+	}
+}
+
+func TestDelete_FallbackListError(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	fakeClient := createFakeClient(scheme)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	nodeClaim := createDefaultNodeClaim()
+	nodeClaim.Status.ProviderID = ""
+
+	fakeClient.listErr = fmt.Errorf("fallback list error")
+
+	err := provider.Delete(ctx, nodeClaim)
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if !contains(err.Error(), "fallback list error") {
+		t.Errorf("Expected error containing 'fallback list error', got %q", err.Error())
+	}
+}
+
+func TestDelete_FallbackDeleteError(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClaim := createDefaultNodeClaim()
+	nodeClaim.Status.ProviderID = ""
+
+	machine := &capiv1beta1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-machine",
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				Kind: "NodeClaim",
+				Name: nodeClaim.Name,
+			}},
+		},
+	}
+
+	fakeClient := createFakeClient(scheme, machine)
+	fakeClient.deleteErr = fmt.Errorf("delete failed")
+
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	err := provider.Delete(ctx, nodeClaim)
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if !contains(err.Error(), "delete failed") {
+		t.Errorf("Expected error containing 'delete failed', got %q", err.Error())
+	}
+}
+
+func TestDelete_FallbackNoMatchingOwner(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClaim := createDefaultNodeClaim()
+	nodeClaim.Status.ProviderID = ""
+
+	machine := &capiv1beta1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-machine",
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				Kind: "NodeClaim",
+				Name: "other-nodeclaim",
+			}},
+		},
+	}
+
+	fakeClient := createFakeClient(scheme, machine)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	err := provider.Delete(ctx, nodeClaim)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+}
+
+func TestFilterUnwantedSpot_NoAvailableOfferings(t *testing.T) {
+	requirements := scheduling.NewRequirements(
+		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "ap-guangzhou-1"),
+		scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeSpot),
+	)
+	it := &cloudprovider.InstanceType{
+		Name:         "S3.NOAVAIL",
+		Requirements: requirements,
+		Offerings: []*cloudprovider.Offering{{
+			Requirements: requirements,
+			Price:        0.5,
+			Available:    false,
+		}},
+	}
+
+	onDemandReqs := scheduling.NewRequirements(
+		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "ap-guangzhou-1"),
+		scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeOnDemand),
+	)
+	odIT := &cloudprovider.InstanceType{
+		Name:         "S3.AVAIL",
+		Requirements: onDemandReqs,
+		Offerings: []*cloudprovider.Offering{{
+			Requirements: onDemandReqs,
+			Price:        1.0,
+			Available:    true,
+		}},
+	}
+
+	result := filterUnwantedSpot([]*cloudprovider.InstanceType{it, odIT})
+	for _, r := range result {
+		if r.Name == "S3.NOAVAIL" {
+			t.Error("Expected instance with no available offerings to be filtered out")
+		}
+	}
+}
+
+func TestOrderInstanceTypesByPrice_EqualPrices(t *testing.T) {
+	requirements := scheduling.NewRequirements(
+		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "ap-guangzhou-1"),
+		scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeOnDemand),
+	)
+
+	itB := createInstanceType("B.MEDIUM4", 4, 8, 1.0, "ap-guangzhou-1", v1.CapacityTypeOnDemand)
+	itA := createInstanceType("A.MEDIUM4", 4, 8, 1.0, "ap-guangzhou-1", v1.CapacityTypeOnDemand)
+
+	result := orderInstanceTypesByPrice([]*cloudprovider.InstanceType{itB, itA}, requirements)
+
+	if result[0].Name != "A.MEDIUM4" {
+		t.Errorf("Expected A.MEDIUM4 first (alphabetical tie-break), got %s", result[0].Name)
+	}
+	if result[1].Name != "B.MEDIUM4" {
+		t.Errorf("Expected B.MEDIUM4 second, got %s", result[1].Name)
+	}
+}
+
+func TestOrderInstanceTypesByPrice_NoCompatibleOfferings(t *testing.T) {
+	requirements := scheduling.NewRequirements(
+		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "ap-shanghai-1"),
+		scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeOnDemand),
+	)
+
+	itA := createInstanceType("A.MEDIUM4", 4, 8, 1.0, "ap-guangzhou-1", v1.CapacityTypeOnDemand)
+	itB := createInstanceType("B.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand)
+
+	result := orderInstanceTypesByPrice([]*cloudprovider.InstanceType{itA, itB}, requirements)
+
+	if result[0].Name != "A.MEDIUM4" {
+		t.Errorf("Expected A.MEDIUM4 first (both MaxFloat64, alphabetical), got %s", result[0].Name)
+	}
+}
+
+func TestCreate_SecurityGroupTruncation(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClass.Status.SecurityGroups = []api.SecurityGroup{
+		{ID: "sg-1"}, {ID: "sg-2"}, {ID: "sg-3"}, {ID: "sg-4"},
+		{ID: "sg-5"}, {ID: "sg-6"}, {ID: "sg-7"},
+	}
+
+	nodeClaim := createDefaultNodeClaim()
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, providerSpec, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if len(providerSpec.SecurityGroupIDs) != 5 {
+		t.Errorf("Expected 5 security groups (truncated), got %d", len(providerSpec.SecurityGroupIDs))
+	}
+}
+
+func TestCreate_InternetAccessibleBandwidthPackage(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClass.Spec.InternetAccessible = &api.InternetAccessible{
+		BandwidthPackageID: lo.ToPtr("bwp-123"),
+	}
+
+	nodeClaim := createDefaultNodeClaim()
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, providerSpec, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if providerSpec.InternetAccessible == nil {
+		t.Fatal("Expected InternetAccessible to be set")
+	}
+	if providerSpec.InternetAccessible.BandwidthPackageID != "bwp-123" {
+		t.Errorf("Expected BandwidthPackageID bwp-123, got %s", providerSpec.InternetAccessible.BandwidthPackageID)
+	}
+}
+
+func TestCreate_DataDiskFileSystem(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	xfs := api.FileSystemXFS
+	nodeClass.Spec.DataDisks = []api.DataDisk{
+		{
+			Size:       100,
+			Type:       api.DiskTypeCloudSSD,
+			FileSystem: &xfs,
+		},
+	}
+
+	nodeClaim := createDefaultNodeClaim()
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, providerSpec, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if len(providerSpec.DataDisks) != 1 {
+		t.Fatalf("Expected 1 data disk, got %d", len(providerSpec.DataDisks))
+	}
+	if providerSpec.DataDisks[0].FileSystem != "xfs" {
+		t.Errorf("Expected xfs filesystem, got %s", providerSpec.DataDisks[0].FileSystem)
+	}
+}
+
+func TestCreate_DataDiskMountTarget(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClass.Spec.DataDisks = []api.DataDisk{
+		{
+			Size:        100,
+			Type:        api.DiskTypeCloudSSD,
+			MountTarget: lo.ToPtr("/mnt/data"),
+		},
+	}
+
+	nodeClaim := createDefaultNodeClaim()
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, providerSpec, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if len(providerSpec.DataDisks) != 1 {
+		t.Fatalf("Expected 1 data disk, got %d", len(providerSpec.DataDisks))
+	}
+	if !providerSpec.DataDisks[0].AutoFormatAndMount {
+		t.Error("Expected AutoFormatAndMount to be true")
+	}
+	if providerSpec.DataDisks[0].MountTarget != "/mnt/data" {
+		t.Errorf("Expected mount target /mnt/data, got %s", providerSpec.DataDisks[0].MountTarget)
+	}
+}
+
+func TestCreate_GPUFabricTrue(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClaim := createDefaultNodeClaim()
+	nodeClaim.Annotations[api.AnnotationFabricKey] = "true"
+
+	instanceType := createInstanceType("GN7.2XLARGE32", 8, 32, 2.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand)
+	instanceType.Capacity[corev1.ResourceName(api.ResourceNVIDIAGPU)] = resource.MustParse("1")
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	machine, _, err := provider.Create(ctx, nodeClass, nodeClaim, []*cloudprovider.InstanceType{instanceType})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if !machine.Spec.GPUConfig.Fabric {
+		t.Error("Expected GPU Fabric to be true")
+	}
+}
+
+func TestCreate_SpotWithInternetAccessible(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClass.Spec.InternetAccessible = &api.InternetAccessible{
+		MaxBandwidthOut: lo.ToPtr(int32(10)),
+	}
+
+	nodeClaim := createDefaultNodeClaim()
+	nodeClaim.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
+		{
+			Key:      corev1.LabelTopologyZone,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{"ap-guangzhou-1"},
+		},
+		{
+			Key:      v1.CapacityTypeLabelKey,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{v1.CapacityTypeSpot},
+		},
+	}
+
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.3, "ap-guangzhou-1", v1.CapacityTypeSpot),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, providerSpec, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if providerSpec.InternetAccessible == nil {
+		t.Fatal("Expected InternetAccessible to be set")
+	}
+	if !providerSpec.InternetAccessible.PublicIPAssigned {
+		t.Error("Expected PublicIPAssigned to be true for spot")
+	}
+	if providerSpec.InternetAccessible.AddressType != capiv1beta1.PublicIpAddressType {
+		t.Errorf("Expected PublicIpAddressType for spot, got %s", providerSpec.InternetAccessible.AddressType)
+	}
+}
+
+func TestCreate_InvalidHostIP(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClaim := createDefaultNodeClaim()
+	// Set an invalid IP in hosts annotation
+	nodeClaim.Annotations = map[string]string{
+		api.AnnotationHostsPrefix + "not-an-ip": "host1.example.com",
+	}
+
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, providerSpec, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	// Invalid IPs should be skipped
+	if len(providerSpec.Management.Hosts) != 0 {
+		t.Errorf("Expected no hosts for invalid IP, got %d", len(providerSpec.Management.Hosts))
+	}
+}
+
+func TestCreate_HostnameAnnotation(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClaim := createDefaultNodeClaim()
+	nodeClaim.Annotations = map[string]string{
+		api.AnnotationHostnameKey: "my-hostname",
+	}
+
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, providerSpec, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if providerSpec.HostName != "my-hostname" {
+		t.Errorf("Expected hostname my-hostname, got %s", providerSpec.HostName)
+	}
+}
+
+func TestCreate_RuntimeRootAnnotation(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClaim := createDefaultNodeClaim()
+	nodeClaim.Annotations = map[string]string{
+		api.AnnotationRuntimeRootKey: "/data/docker",
+	}
+
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	machine, _, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if machine.Spec.RuntimeRootDir != "/data/docker" {
+		t.Errorf("Expected RuntimeRootDir /data/docker, got %s", machine.Spec.RuntimeRootDir)
+	}
+}
+
+func TestCreate_KubeClientCreateError(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClaim := createDefaultNodeClaim()
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	fakeClient.createErr = fmt.Errorf("create failed")
+
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	_, _, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err == nil {
+		t.Fatal("Expected error from kubeClient.Create")
+	}
+	if !contains(err.Error(), "create failed") {
+		t.Errorf("Expected 'create failed' in error, got %q", err.Error())
+	}
+}
+
+// ====== Tests for uncovered Create paths ======
+
+// TestCreate_ENICapacityAnnotations verifies that ENI-related capacity annotations
+// (ENIIP, DirectENI, ENI, SubENI, EIP) are written when present in the instance type Capacity.
+func TestCreate_ENICapacityAnnotations(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClaim := createDefaultNodeClaim()
+
+	// Create instance type with ENI resources in Capacity
+	instanceType := createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand)
+	instanceType.Capacity[corev1.ResourceName(api.TKELabelENIIP)] = resource.MustParse("32")
+	instanceType.Capacity[corev1.ResourceName(api.TKELabelDirectENI)] = resource.MustParse("8")
+	instanceType.Capacity[corev1.ResourceName(api.TKELabelENI)] = resource.MustParse("4")
+	instanceType.Capacity[corev1.ResourceName(api.TKELabelSubENI)] = resource.MustParse("16")
+	instanceType.Capacity[corev1.ResourceName(api.TKELabelEIP)] = resource.MustParse("2")
+
+	instanceTypes := []*cloudprovider.InstanceType{instanceType}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	machine, _, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	tests := []struct {
+		key      string
+		expected string
+	}{
+		{api.CapacityGroup + api.AnnotationENIIP, "32"},
+		{api.CapacityGroup + api.AnnotationDirectENI, "8"},
+		{api.CapacityGroup + api.AnnotationENI, "4"},
+		{api.CapacityGroup + api.AnnotationSubENI, "16"},
+		{api.CapacityGroup + api.AnnotationEIP, "2"},
+	}
+
+	for _, tt := range tests {
+		got, exists := machine.Annotations[tt.key]
+		if !exists {
+			t.Errorf("Expected annotation %s to exist", tt.key)
+			continue
+		}
+		if got != tt.expected {
+			t.Errorf("Expected annotation %s=%s, got %s", tt.key, tt.expected, got)
+		}
+	}
+}
+
+// TestCreate_SystemReservedAnnotations verifies that SystemReserved CPU, memory,
+// and ephemeral-storage annotations are written when these resources are non-zero.
+func TestCreate_SystemReservedAnnotations(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClaim := createDefaultNodeClaim()
+
+	// Create instance type with non-zero SystemReserved including ephemeral-storage
+	instanceType := createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand)
+	instanceType.Overhead.SystemReserved[corev1.ResourceCPU] = resource.MustParse("200m")
+	instanceType.Overhead.SystemReserved[corev1.ResourceMemory] = resource.MustParse("256Mi")
+	instanceType.Overhead.SystemReserved[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
+
+	instanceTypes := []*cloudprovider.InstanceType{instanceType}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	machine, _, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	// Verify SystemReserved CPU annotation
+	cpuKey := api.SystemReservedGroup + api.AnnotationCPU
+	if got := machine.Annotations[cpuKey]; got != "200m" {
+		t.Errorf("Expected annotation %s=200m, got %s", cpuKey, got)
+	}
+
+	// Verify SystemReserved Memory annotation
+	memKey := api.SystemReservedGroup + api.AnnotationMemory
+	if got := machine.Annotations[memKey]; got != "256Mi" {
+		t.Errorf("Expected annotation %s=256Mi, got %s", memKey, got)
+	}
+
+	// Verify SystemReserved EphemeralStorage annotation (line 378-380 in machine.go)
+	storageKey := api.SystemReservedGroup + api.AnnotationEphemeralStorage
+	if got, exists := machine.Annotations[storageKey]; !exists {
+		t.Errorf("Expected annotation %s to exist", storageKey)
+	} else if got != "1Gi" {
+		t.Errorf("Expected annotation %s=1Gi, got %s", storageKey, got)
+	}
+}
+
+// TestCreate_KubeReservedStorageAnnotation verifies that KubeReserved ephemeral-storage
+// annotation is written when KubeReserved.StorageEphemeral is non-zero.
+// Note: in machine.go line 369, this overwrites the KubeReservedGroup+AnnotationMemory key.
+func TestCreate_KubeReservedStorageAnnotation(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClaim := createDefaultNodeClaim()
+
+	// Create instance type with non-zero KubeReserved ephemeral-storage
+	instanceType := createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand)
+	instanceType.Overhead.KubeReserved[corev1.ResourceEphemeralStorage] = resource.MustParse("2Gi")
+
+	instanceTypes := []*cloudprovider.InstanceType{instanceType}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	machine, _, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	// In machine.go line 368-370, when KubeReserved.StorageEphemeral is non-zero,
+	// it writes to KubeReservedGroup+AnnotationMemory (this is the actual code behavior).
+	memKey := api.KubeReservedGroup + api.AnnotationMemory
+	if got, exists := machine.Annotations[memKey]; !exists {
+		t.Errorf("Expected annotation %s to exist", memKey)
+	} else if got != "2Gi" {
+		t.Errorf("Expected annotation %s=2Gi (overwritten by KubeReserved ephemeral-storage), got %s", memKey, got)
+	}
+}
+
+// TestCreate_WithTags verifies that nodeClass.Spec.Tags are serialized as JSON
+// to the AnnotationMachineCloudTag annotation.
+func TestCreate_WithTags(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClass.Spec.Tags = map[string]string{
+		"env":   "production",
+		"owner": "team-karpenter",
+	}
+
+	nodeClaim := createDefaultNodeClaim()
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	machine, _, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	tagAnnotation, exists := machine.Annotations[capiv1beta1.AnnotationMachineCloudTag]
+	if !exists {
+		t.Fatalf("Expected annotation %s to exist", capiv1beta1.AnnotationMachineCloudTag)
+	}
+
+	// Deserialize and verify tags
+	var tags []Tag
+	if err := json.Unmarshal([]byte(tagAnnotation), &tags); err != nil {
+		t.Fatalf("Failed to unmarshal tag annotation: %v", err)
+	}
+
+	if len(tags) != 2 {
+		t.Errorf("Expected 2 tags, got %d", len(tags))
+	}
+
+	tagMap := make(map[string]string)
+	for _, tag := range tags {
+		tagMap[tag.TagKey] = tag.TagValue
+	}
+
+	if tagMap["env"] != "production" {
+		t.Errorf("Expected tag env=production, got %s", tagMap["env"])
+	}
+	if tagMap["owner"] != "team-karpenter" {
+		t.Errorf("Expected tag owner=team-karpenter, got %s", tagMap["owner"])
+	}
+}
+
+// TestCreate_WithTagsEmpty verifies that empty tags do NOT produce the cloud tag annotation.
+func TestCreate_WithTagsEmpty(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClass.Spec.Tags = map[string]string{}
+
+	nodeClaim := createDefaultNodeClaim()
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	machine, _, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if _, exists := machine.Annotations[capiv1beta1.AnnotationMachineCloudTag]; exists {
+		t.Error("Expected cloud tag annotation to NOT exist for empty tags")
+	}
+}
+
+// TestCreate_MachineMetaAnnotations verifies that machine meta annotations from
+// nodeClaim annotations (AnnotationMachineMetaAnnotationsKey) are written to machine.Annotations.
+func TestCreate_MachineMetaAnnotations(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClaim := createDefaultNodeClaim()
+	nodeClaim.Annotations = map[string]string{
+		api.AnnotationMachineMetaAnnotationsKey: "custom-key1=custom-value1,custom-key2=custom-value2",
+	}
+
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	machine, _, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if got, exists := machine.Annotations["custom-key1"]; !exists {
+		t.Error("Expected annotation custom-key1 to exist")
+	} else if got != "custom-value1" {
+		t.Errorf("Expected annotation custom-key1=custom-value1, got %s", got)
+	}
+
+	if got, exists := machine.Annotations["custom-key2"]; !exists {
+		t.Error("Expected annotation custom-key2 to exist")
+	} else if got != "custom-value2" {
+		t.Errorf("Expected annotation custom-key2=custom-value2, got %s", got)
+	}
+}
+
+// TestCreate_InvalidThroughput verifies that an invalid throughput value
+// triggers the warning path (klog.Warningf) and does not panic.
+func TestCreate_InvalidThroughput(t *testing.T) {
+	scheme := createScheme()
+	ctx := context.Background()
+
+	nodeClass := createDefaultNodeClass()
+	nodeClass.Spec.DataDisks = []api.DataDisk{
+		{
+			Size: 100,
+			Type: api.DiskTypeCloudSSD,
+		},
+	}
+	// Set an invalid (non-numeric) throughput value for data disk index 0
+	nodeClass.Annotations = map[string]string{
+		api.AnnotationDataDisksThroughputKey: "0=not-a-number",
+	}
+
+	nodeClaim := createDefaultNodeClaim()
+	instanceTypes := []*cloudprovider.InstanceType{
+		createInstanceType("S3.MEDIUM4", 4, 8, 0.5, "ap-guangzhou-1", v1.CapacityTypeOnDemand),
+	}
+
+	fakeClient := createFakeClient(scheme, nodeClass, nodeClaim)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	// Should not panic and should not return an error
+	_, providerSpec, err := provider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	// The invalid throughput should be ignored (default 0)
+	if len(providerSpec.DataDisks) != 1 {
+		t.Fatalf("Expected 1 data disk, got %d", len(providerSpec.DataDisks))
+	}
+	if providerSpec.DataDisks[0].ThroughputPerformance != 0 {
+		t.Errorf("Expected ThroughputPerformance to be 0 for invalid value, got %d", providerSpec.DataDisks[0].ThroughputPerformance)
 	}
 }

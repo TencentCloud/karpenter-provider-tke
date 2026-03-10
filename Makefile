@@ -46,3 +46,20 @@ release: build image ## release
 integration-test: ## run integration tests
 	@bash test/integration/run-test.sh
 
+TEST_SUITE?=integration
+FOCUS?=
+
+.PHONY: e2etests
+e2etests: ## run Go e2e tests (TEST_SUITE=integration|lifecycle, FOCUS=regex)
+	go test -p 1 -count 1 -timeout 2h -v \
+		./test/suites/$(shell echo $(TEST_SUITE) | tr A-Z a-z)/... \
+		--ginkgo.focus="$(FOCUS)" \
+		--ginkgo.timeout=1.5h \
+		--ginkgo.grace-period=3m \
+		--ginkgo.vv
+
+.PHONY: test
+test: ## run unit tests with coverage report
+	go test -coverprofile=coverage.out -covermode=atomic ./pkg/... || true
+	@[ -f coverage.out ] && go tool cover -func=coverage.out || true
+

@@ -3,11 +3,24 @@
 # A comprehensive integration test suite for open-karpenter-provider-tke
 #
 # This script will:
-#   1. Set up the environment, discover cloud resources, and CREATE A NEW SUBNET.
-#   2. Build and push a new controller image.
-#   3. Install Karpenter using Helm and wait for CRDs to be ready.
-#   4. Run a series of test cases using the new subnet.
-#   5. Perform a full cleanup, including DELETING THE CREATED SUBNET.
+#   1. Set up the environment. On the first run it queries cloud resources via tccli
+#      and creates a dedicated test subnet, then saves all discovered values to
+#      test/integration/env.cache. On subsequent runs the cache is loaded directly,
+#      skipping all tccli calls (no tccli dependency required).
+#   2. Optionally build & push a new controller image and (re-)install Karpenter via
+#      Helm. This step is controlled by the INSTALL_KARPENTER variable (default: false).
+#      Set INSTALL_KARPENTER=true to rebuild the image and reinstall; otherwise the
+#      already-running Karpenter deployment is reused and no AK/SK is required.
+#   3. Run a series of test cases using the cached subnet.
+#   4. Perform cleanup of Kubernetes resources only. The test subnet is kept so it
+#      can be reused across runs.
+#
+# Usage:
+#   # Run tests only (no reinstall, no AK/SK needed):
+#   ./test/integration/run-test.sh
+#
+#   # Rebuild image and reinstall Karpenter before running tests:
+#   INSTALL_KARPENTER=true ./test/integration/run-test.sh
 
 set -eo pipefail
 
@@ -53,7 +66,7 @@ setup_dependencies() {
 
 discover_and_setup_environment() {
     log_info "Discovering environment variables and cloud provider info..."
-    
+
     if [ -f "./env" ]; then
         source ./env
     else
@@ -61,34 +74,60 @@ discover_and_setup_environment() {
     fi
 
     if [ -z "${KUBECONFIG}" ]; then
-         log_fail "KUBECONFIG not set in ./env"
+        log_fail "KUBECONFIG not set in ./env"
     fi
     export KUBECONFIG_PATH="${KUBECONFIG}"
     log_info "Using KUBECONFIG: ${KUBECONFIG_PATH}"
-    
-    # Verify kubectl connectivity immediately
+
     if ! run_kubectl get nodes > /dev/null; then
         log_fail "kubectl failed to connect to cluster using ${KUBECONFIG_PATH}"
     fi
 
-    export TENCENT_CLOUD_SECRET_ID=$(awk -F: '/SecretId/ {print $2}' ./secret)
-    export TENCENT_CLOUD_SECRET_KEY=$(awk -F: '/SecretKey/ {print $2}' ./secret)
-    export IMAGE_TAG="test-$(date +%s)"
+    # Ensure the default namespace is used for test resources (kubeconfig may set a different default)
+    run_kubectl config set-context --current --namespace=default > /dev/null
 
-    local node_name instance_id filters instance_details vpc_id
-    local zone
+    # Extract CLUSTER_NAME from the kubeconfig server URL (no tccli dependency)
+    local server_url
+    server_url=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
+    CLUSTER_NAME=$(echo "${server_url}" | grep -oE 'cls-[a-z0-9]+')
+    if [ -z "${CLUSTER_NAME}" ]; then
+        log_fail "Could not extract cluster ID from server URL: ${server_url}"
+    fi
+    log_info "Cluster ID: ${CLUSTER_NAME}"
+
+    local cache_file="test/integration/env.cache"
+
+    # ---------- Cache hit: load from cache, skip all tccli calls ----------
+    if [ -f "${cache_file}" ]; then
+        log_info "Cache file '${cache_file}' found. Loading environment from cache (skipping tccli)."
+        source "${cache_file}"
+        if [ -z "${REGION}" ] || [ -z "${SUBNET_ID}" ] || [ -z "${SECURITY_GROUP_ID}" ] \
+            || [ -z "${SSH_KEY_ID}" ] || [ -z "${ZONE}" ] || [ -z "${ZONE_ID}" ] \
+            || [ -z "${CCR_PREFIX}" ]; then
+            log_fail "Cache file is incomplete. Delete '${cache_file}' and re-run to regenerate."
+        fi
+        log_info "Loaded from cache: REGION=${REGION} SUBNET_ID=${SUBNET_ID} ZONE=${ZONE} ZONE_ID=${ZONE_ID} CCR_PREFIX=${CCR_PREFIX}"
+        HK2_SUBNET_ID="${SUBNET_ID}"
+        TEST_SUBNET_ID="${SUBNET_ID}"
+        export REGION SUBNET_ID SECURITY_GROUP_ID SSH_KEY_ID CLUSTER_NAME REGISTRY \
+               TEST_SUBNET_ID HK2_SUBNET_ID ZONE ZONE_ID CCR_PREFIX
+        return
+    fi
+
+    # ---------- Cache miss: query cloud resources via tccli, create subnet, write cache ----------
+    log_info "Cache file not found. Querying cloud resources via tccli..."
+
+    local node_name instance_id filters instance_details vpc_id zone
     node_name=$(run_kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
     log_info "Node name: '${node_name}'"
-    
     if [ -z "${node_name}" ]; then
-         log_fail "Failed to get node name"
+        log_fail "Failed to get node name"
     fi
 
     instance_id=$(run_kubectl get node "${node_name}" -o jsonpath='{.metadata.labels.cloud\.tencent\.com/node-instance-id}')
     log_info "Instance ID: '${instance_id}'"
-
     if [ -z "${instance_id}" ]; then
-         log_fail "Failed to get instance ID from node '${node_name}'"
+        log_fail "Failed to get instance ID from node '${node_name}'"
     fi
 
     local node_region
@@ -104,93 +143,88 @@ discover_and_setup_environment() {
         "cq") region_map="ap-chongqing" ;;
         "hk") region_map="ap-hongkong" ;;
         "sg") region_map="ap-singapore" ;;
-        *) region_map="${node_region}" ;;
+        *)    region_map="${node_region}" ;;
     esac
     log_info "Mapping region '${node_region}' to '${region_map}'"
     tccli configure set region "${region_map}"
 
     filters='[{"Name":"instance-id", "Values":["'${instance_id}'"]}]'
-    log_info "Using filters: ${filters}"
-
     instance_details=$(tccli cvm DescribeInstances --Filters "${filters}" --output json)
-    # Log first 100 chars of instance_details to check if it worked
     log_info "Instance details (truncated): $(echo "${instance_details}" | head -c 100)"
 
     REGION=$(echo "${instance_details}" | jq -r '.InstanceSet[0].Placement.Zone' | sed 's/-\([0-9]\)$//g')
     vpc_id=$(echo "${instance_details}" | jq -r '.InstanceSet[0].VirtualPrivateCloud.VpcId')
     zone=$(echo "${instance_details}" | jq -r '.InstanceSet[0].Placement.Zone')
-
     log_info "Discovered Region: ${REGION}, VPC: ${vpc_id}, Zone: ${zone}"
 
     if [ -z "${vpc_id}" ] || [ "${vpc_id}" == "null" ]; then
-        log_fail "Failed to discover VPC ID. tccli output might be empty or invalid."
+        log_fail "Failed to discover VPC ID."
     fi
 
-    # Create a new subnet for this test run to avoid IP exhaustion.
-    # Use a unique CIDR derived from the timestamp to avoid conflicts across parallel runs.
-    # Get VPC CIDR to determine valid subnet range
-    local vpc_details
+    local vpc_details vpc_cidr
     vpc_details=$(tccli vpc DescribeVpcs --VpcIds "[\"${vpc_id}\"]" --output json)
-    local vpc_cidr
     vpc_cidr=$(echo "${vpc_details}" | jq -r '.VpcSet[0].CidrBlock')
     log_info "VPC CIDR: ${vpc_cidr}"
-
     if [ -z "${vpc_cidr}" ] || [ "${vpc_cidr}" == "null" ]; then
         log_fail "Failed to get VPC CIDR."
     fi
 
-    local vpc_prefix=$(echo "${vpc_cidr}" | cut -d'/' -f1)
-    # Extract first two octets
-    local octet1=$(echo "${vpc_prefix}" | cut -d'.' -f1)
-    local octet2=$(echo "${vpc_prefix}" | cut -d'.' -f2)
-    
-    # Generate a random 3rd octet to avoid conflicts
-    local random_octet=$(( ($(date +%s) % 150) + 50 ))
-    local new_subnet_cidr="${octet1}.${octet2}.${random_octet}.0/24"
+    local octet1 octet2 random_octet new_subnet_cidr
+    octet1=$(echo "${vpc_cidr}" | cut -d'/' -f1 | cut -d'.' -f1)
+    octet2=$(echo "${vpc_cidr}" | cut -d'/' -f1 | cut -d'.' -f2)
+    random_octet=$(( ($(date +%s) % 150) + 50 ))
+    new_subnet_cidr="${octet1}.${octet2}.${random_octet}.0/24"
     log_info "Generated Subnet CIDR: ${new_subnet_cidr}"
 
-    local new_subnet_name="karpenter-test-subnet-${IMAGE_TAG}"
-    log_info "Creating a new subnet '${new_subnet_name}' with CIDR ${new_subnet_cidr} in VPC ${vpc_id} and Zone ${zone}..."
+    local new_subnet_name="karpenter-test-subnet-$(date +%s)"
+    log_info "Creating subnet '${new_subnet_name}' (${new_subnet_cidr}) in VPC ${vpc_id} Zone ${zone}..."
     local create_subnet_result
-    create_subnet_result=$(tccli vpc CreateSubnet --VpcId "${vpc_id}" --SubnetName "${new_subnet_name}" --CidrBlock "${new_subnet_cidr}" --Zone "${zone}" --output json)
+    create_subnet_result=$(tccli vpc CreateSubnet --VpcId "${vpc_id}" --SubnetName "${new_subnet_name}" \
+        --CidrBlock "${new_subnet_cidr}" --Zone "${zone}" --output json)
 
     TEST_SUBNET_ID=$(echo "${create_subnet_result}" | jq -r '.Subnet.SubnetId')
     if [ -z "${TEST_SUBNET_ID}" ] || [ "${TEST_SUBNET_ID}" == "null" ]; then
-        log_fail "Failed to create new subnet. CLI output: ${create_subnet_result}"
+        log_fail "Failed to create subnet. CLI output: ${create_subnet_result}"
     fi
-    log_info "Successfully created subnet with ID: ${TEST_SUBNET_ID} (CIDR: ${new_subnet_cidr})"
-
-    # Use this new subnet for the tests
-    SUBNET_ID=${TEST_SUBNET_ID}
+    log_info "Created subnet: ${TEST_SUBNET_ID} (CIDR: ${new_subnet_cidr})"
+    SUBNET_ID="${TEST_SUBNET_ID}"
 
     SECURITY_GROUP_ID=$(echo "${instance_details}" | jq -r '.InstanceSet[0].SecurityGroupIds[0]')
     SSH_KEY_ID=$(tccli cvm DescribeKeyPairs --output json | jq -r '.KeyPairSet[0].KeyId')
-    # Extract the real cluster ID from the server URL (e.g. https://cls-xxxx.xxx.tke.woa.com)
-    local server_url
-    server_url=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
-    CLUSTER_NAME=$(echo "${server_url}" | grep -oE 'cls-[a-z0-9]+')
-    if [ -z "${CLUSTER_NAME}" ]; then
-        log_fail "Could not extract cluster ID from server URL: ${server_url}"
-    fi
-    log_info "Cluster ID: ${CLUSTER_NAME}"
 
-    # Derive the zone ID for the zone constraint test (uses same zone as the cluster)
     ZONE_ID=$(tccli cvm DescribeZones --output json | jq -r --arg z "${zone}" '.ZoneSet[] | select(.Zone == $z) | .ZoneId')
     if [ -z "${ZONE_ID}" ] || [ "${ZONE_ID}" == "null" ]; then
         log_fail "Could not determine zone ID for zone ${zone}."
     fi
-    log_info "Cluster zone: ${zone} (ID: ${ZONE_ID})"
-
-    # Use the same subnet as SUBNET_ID for the zone-test nodeclass (same zone)
-    HK2_SUBNET_ID=${TEST_SUBNET_ID}
+    log_info "Zone: ${zone} (ID: ${ZONE_ID})"
 
     ZONE="${zone}"
-    export REGION SUBNET_ID SECURITY_GROUP_ID SSH_KEY_ID CLUSTER_NAME REGISTRY TEST_SUBNET_ID HK2_SUBNET_ID ZONE ZONE_ID
-}
+    HK2_SUBNET_ID="${TEST_SUBNET_ID}"
 
-build_and_push_image() {
-    log_info "Building and pushing controller image (Tag: ${IMAGE_TAG})..."
-    make image TAG="${IMAGE_TAG}" REGISTRY="${REGISTRY}"
+    case "${REGION}" in
+        "ap-hongkong")  CCR_PREFIX="hkccr" ;;
+        "ap-singapore") CCR_PREFIX="sgccr" ;;
+        *)              CCR_PREFIX="ccr" ;;
+    esac
+    log_info "CCR prefix: ${CCR_PREFIX}"
+
+    # Write cache file for reuse on subsequent runs
+    log_info "Saving environment to cache file '${cache_file}'..."
+    cat > "${cache_file}" <<CACHE
+# Auto-generated by run-test.sh on $(date)
+# Delete this file to force re-discovery via tccli.
+REGION="${REGION}"
+SUBNET_ID="${SUBNET_ID}"
+SECURITY_GROUP_ID="${SECURITY_GROUP_ID}"
+SSH_KEY_ID="${SSH_KEY_ID}"
+ZONE="${ZONE}"
+ZONE_ID="${ZONE_ID}"
+CCR_PREFIX="${CCR_PREFIX}"
+CACHE
+    log_info "Cache written to '${cache_file}'."
+
+    export REGION SUBNET_ID SECURITY_GROUP_ID SSH_KEY_ID CLUSTER_NAME REGISTRY \
+           TEST_SUBNET_ID HK2_SUBNET_ID ZONE ZONE_ID CCR_PREFIX
 }
 
 wait_for_crds_established() {
@@ -216,16 +250,33 @@ wait_for_crds_established() {
     done
 }
 
+build_and_push_image() {
+    log_info "Building and pushing controller image (Tag: ${IMAGE_TAG})..."
+    make image TAG="${IMAGE_TAG}" REGISTRY="${REGISTRY}"
+}
+
 install_karpenter() {
     log_info "Installing Karpenter..."
+
+    # Read AK/SK (only needed here; no other step depends on it)
+    if [ ! -f "./secret" ]; then
+        log_fail "./secret file not found. AK/SK is required for Karpenter installation."
+    fi
+    local secret_id secret_key
+    secret_id=$(awk -F: '/SecretId/ {print $2}' ./secret)
+    secret_key=$(awk -F: '/SecretKey/ {print $2}' ./secret)
+    if [ -z "${secret_id}" ] || [ -z "${secret_key}" ]; then
+        log_fail "Could not parse SecretId/SecretKey from ./secret."
+    fi
+
     run_helm uninstall karpenter -n karpenter > /dev/null 2>&1 || true
     log_info "Waiting 15 seconds for old resources to be cleaned up..."
     sleep 15
 
     run_kubectl create ns karpenter --dry-run=client -o yaml | run_kubectl apply -f -
     run_kubectl create secret generic karpenter-secret -n karpenter \
-      --from-literal=secretID="${TENCENT_CLOUD_SECRET_ID}" \
-      --from-literal=secretKey="${TENCENT_CLOUD_SECRET_KEY}" \
+      --from-literal=secretID="${secret_id}" \
+      --from-literal=secretKey="${secret_key}" \
       --dry-run=client -o yaml | run_kubectl apply -f -
 
     log_info "Attempting Helm install..."
@@ -262,6 +313,15 @@ cleanup_test_resources() {
     run_kubectl delete --ignore-not-found -f test/integration/nodepool-expiry.yaml
     run_kubectl delete --ignore-not-found -f test/integration/nodepool-fallback-invalid.yaml
     run_kubectl delete --ignore-not-found -f test/integration/nodepool-fallback-valid.yaml
+    run_kubectl delete --ignore-not-found -f test/integration/nodepool-kernel-args.yaml
+    if [ -f test/integration/tkemachinenodeclass-datadisk-encrypt.yaml ]; then
+        run_kubectl delete --ignore-not-found -f test/integration/tkemachinenodeclass-datadisk-encrypt.yaml
+        rm -f test/integration/tkemachinenodeclass-datadisk-encrypt.yaml
+    fi
+    if [ -f test/integration/tkemachinenodeclass-datadisk-noencrypt.yaml ]; then
+        run_kubectl delete --ignore-not-found -f test/integration/tkemachinenodeclass-datadisk-noencrypt.yaml
+        rm -f test/integration/tkemachinenodeclass-datadisk-noencrypt.yaml
+    fi
     if [ -f test/integration/tkemachinenodeclass.yaml ]; then
         run_kubectl delete --ignore-not-found -f test/integration/tkemachinenodeclass.yaml
         rm -f test/integration/tkemachinenodeclass.yaml
@@ -290,50 +350,43 @@ cleanup_test_resources() {
 cleanup_all() {
     log_info "Performing full cleanup of all integration test resources..."
     cleanup_test_resources
-    run_helm uninstall karpenter -n karpenter || true
-    log_info "Waiting 30 seconds for Helm resources to terminate..."
-    sleep 30
 
-    if run_kubectl get ns karpenter > /dev/null 2>&1; then
-        log_info "Namespace 'karpenter' still exists. Force deleting..."
-        # Remove finalizers from cluster-scoped Karpenter resources
-        local cluster_resources="tkemachinenodeclasses.karpenter.k8s.tke nodepools.karpenter.sh nodeclaims.karpenter.sh"
-        for resource in $cluster_resources; do
-            run_kubectl get "$resource" -o name 2>/dev/null | while read -r res_name; do
-                log_info "Removing finalizers from $res_name"
-                run_kubectl patch "$res_name" -p '{"metadata":{"finalizers":[]}}' --type=merge
+    # Only uninstall Karpenter if it was installed by this run
+    if [ "${INSTALL_KARPENTER:-false}" = "true" ]; then
+        run_helm uninstall karpenter -n karpenter || true
+        log_info "Waiting 30 seconds for Helm resources to terminate..."
+        sleep 30
+
+        if run_kubectl get ns karpenter > /dev/null 2>&1; then
+            log_info "Namespace 'karpenter' still exists. Force deleting..."
+            # Remove finalizers from cluster-scoped Karpenter resources
+            local cluster_resources="tkemachinenodeclasses.karpenter.k8s.tke nodepools.karpenter.sh nodeclaims.karpenter.sh"
+            for resource in $cluster_resources; do
+                run_kubectl get "$resource" -o name 2>/dev/null | while read -r res_name; do
+                    log_info "Removing finalizers from $res_name"
+                    run_kubectl patch "$res_name" -p '{"metadata":{"finalizers":[]}}' --type=merge
+                done
             done
-        done
-        # Remove finalizers from namespaced resources
-        local ns_resources="deployments services secrets roles rolebindings serviceaccounts poddisruptionbudgets leases"
-        for resource in $ns_resources; do
-            run_kubectl get -n karpenter "$resource" -o name 2>/dev/null | while read -r res_name; do
-                log_info "Removing finalizers from $res_name in namespace karpenter"
-                run_kubectl patch -n karpenter "$res_name" -p '{"metadata":{"finalizers":[]}}' --type=merge
+            # Remove finalizers from namespaced resources
+            local ns_resources="deployments services secrets roles rolebindings serviceaccounts poddisruptionbudgets leases"
+            for resource in $ns_resources; do
+                run_kubectl get -n karpenter "$resource" -o name 2>/dev/null | while read -r res_name; do
+                    log_info "Removing finalizers from $res_name in namespace karpenter"
+                    run_kubectl patch -n karpenter "$res_name" -p '{"metadata":{"finalizers":[]}}' --type=merge
+                done
             done
-        done
-        run_kubectl delete ns karpenter --force --grace-period=0 || true
+            run_kubectl delete ns karpenter --force --grace-period=0 || true
+        fi
     fi
 
     if [ -n "${TEST_SUBNET_ID}" ]; then
-        log_info "Deleting dynamically created subnet ${TEST_SUBNET_ID}..."
-        local subnet_deleted=false
-        for (( i=1; i<=6; i++ )); do
-            if tccli vpc DeleteSubnet --SubnetId "${TEST_SUBNET_ID}" > /dev/null 2>&1; then
-                log_info "Successfully deleted subnet ${TEST_SUBNET_ID}."
-                subnet_deleted=true
-                break
-            fi
-            log_info "Subnet deletion attempt $i/6 failed (may have lingering ENIs). Waiting 30s..."
-            sleep 30
-        done
-        if [ "${subnet_deleted}" = false ]; then
-            log_info "WARNING: Could not delete subnet ${TEST_SUBNET_ID} after 6 attempts. Please delete it manually."
-        fi
+        log_info "Test subnet ${TEST_SUBNET_ID} is retained for future runs (cached in test/integration/env.cache)."
     fi
 
     # Clean up any generated YAML files left over from the test run
     rm -f test/integration/tkemachinenodeclass.yaml
+    rm -f test/integration/tkemachinenodeclass-datadisk-encrypt.yaml
+    rm -f test/integration/tkemachinenodeclass-datadisk-noencrypt.yaml
     rm -f test/integration/nodepool-zone.yaml
 
     log_info "Full cleanup complete."
@@ -559,6 +612,195 @@ test_multi_nodepool_fallback() {
     log_pass "--- PASSED: test_multi_nodepool_fallback ---"
 }
 
+test_kernel_args() {
+    log_info "--- RUNNING: test_kernel_args ---"
+    log_info "Scenario: NodePool sets multiple kernel args via annotations:"
+    log_info "  vm.max_map_count=262144, net.core.somaxconn=65535, fs.file-max=1048576"
+    log_info "Expectation: all three sysctl values are applied correctly on the provisioned node."
+
+    generate_valid_nodeclass
+    run_kubectl apply -f test/integration/tkemachinenodeclass.yaml
+    run_kubectl apply -f test/integration/nodepool-kernel-args.yaml
+    run_kubectl apply -f test/integration/deployment.yaml
+
+    log_info "Scaling deployment to trigger node creation..."
+    run_kubectl scale deployment inflate --replicas=1
+
+    local new_node_name
+    new_node_name=$(wait_for_node_ready 60)
+
+    log_info "Verifying kernel args on node ${new_node_name}..."
+
+    # Schedule one pod per sysctl param using direct `cat` to avoid shell expansion issues
+    local sysctl_params=(
+        "vm.max_map_count:/proc/sys/vm/max_map_count"
+        "net.core.somaxconn:/proc/sys/net/core/somaxconn"
+        "fs.file-max:/proc/sys/fs/file-max"
+    )
+    local pod_image="${CCR_PREFIX}.ccs.tencentyun.com/tkeimages/hyperkube:v1.34.1-tke.1-rc3"
+    local actual_values=()
+
+    for entry in "${sysctl_params[@]}"; do
+        local param_name="${entry%%:*}"
+        local proc_path="${entry##*:}"
+        local pod_name="sysctl-checker-${param_name//./-}"
+        pod_name="${pod_name//_/-}"
+
+        run_kubectl delete pod "${pod_name}" --ignore-not-found --wait=true 2>/dev/null || true
+        run_kubectl run "${pod_name}" \
+            --image="${pod_image}" \
+            --restart=Never \
+            --overrides="{
+              \"spec\": {
+                \"tolerations\": [{\"key\":\"karpenter-test\",\"operator\":\"Equal\",\"value\":\"true\",\"effect\":\"NoSchedule\"}],
+                \"nodeSelector\": {\"karpenter-test\": \"true\"},
+                \"hostPID\": true,
+                \"hostNetwork\": true,
+                \"volumes\": [{\"name\":\"proc\",\"hostPath\":{\"path\":\"/proc\"}}],
+                \"containers\": [{
+                  \"name\": \"checker\",
+                  \"image\": \"${pod_image}\",
+                  \"command\": [\"cat\", \"/host-proc${proc_path##/proc}\"],
+                  \"volumeMounts\": [{\"name\":\"proc\",\"mountPath\":\"/host-proc\"}],
+                  \"securityContext\": {\"privileged\": true}
+                }]
+              }
+            }" 2>&1 >/dev/null
+
+        log_info "Waiting for pod ${pod_name} to complete..."
+        local pod_done=false
+        for (( j=1; j<=30; j++ )); do
+            local pod_phase
+            pod_phase=$(run_kubectl get pod "${pod_name}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
+            if [ "${pod_phase}" = "Succeeded" ]; then
+                pod_done=true
+                break
+            elif [ "${pod_phase}" = "Failed" ]; then
+                run_kubectl logs "${pod_name}" || true
+                run_kubectl delete pod "${pod_name}" --ignore-not-found
+                log_fail "Pod ${pod_name} failed."
+            fi
+            log_info "  Pod phase: ${pod_phase} (attempt $j/30). Waiting 5s..."
+            sleep 5
+        done
+        if [ "${pod_done}" = false ]; then
+            run_kubectl describe pod "${pod_name}" || true
+            run_kubectl delete pod "${pod_name}" --ignore-not-found
+            log_fail "Timeout: pod ${pod_name} did not complete."
+        fi
+
+        local actual_value
+        actual_value=$(run_kubectl logs "${pod_name}" | tr -d '[:space:]')
+        log_info "sysctl ${param_name} = ${actual_value}"
+        actual_values+=("${param_name}=${actual_value}")
+        run_kubectl delete pod "${pod_name}" --ignore-not-found
+    done
+
+    declare -A expected_map=(
+        ["vm.max_map_count"]="262144"
+        ["net.core.somaxconn"]="65535"
+        ["fs.file-max"]="1048576"
+    )
+
+    local all_passed=true
+    for entry in "${actual_values[@]}"; do
+        local param="${entry%%=*}"
+        local actual="${entry##*=}"
+        local expected="${expected_map[$param]}"
+        if [ "${actual}" = "${expected}" ]; then
+            log_info "  [OK] ${param} = ${actual}"
+        else
+            log_info "  [FAIL] ${param}: expected '${expected}', got '${actual}'"
+            all_passed=false
+        fi
+    done
+
+    if [ "${all_passed}" = false ]; then
+        log_fail "One or more kernel arg verifications failed."
+    fi
+
+    run_kubectl scale deployment inflate --replicas=0
+    wait_for_node_deleted "${new_node_name}" 60
+
+    cleanup_test_resources
+    log_pass "--- PASSED: test_kernel_args ---"
+}
+
+test_datadisk_encrypt() {
+    log_info "--- RUNNING: test_datadisk_encrypt ---"
+    log_info "Two sub-scenarios:"
+    log_info "  A: data disk with encrypt=ENCRYPT annotation -> Machine providerSpec encrypt=ENCRYPT"
+    log_info "  B: data disk without encrypt annotation     -> Machine providerSpec encrypt empty"
+
+    log_info "--- Sub-scenario A: disk WITH encrypt annotation ---"
+
+    sed -e "s|<YOUR_SUBNET_ID>|${SUBNET_ID}|g" \
+        -e "s|<YOUR_SECURITY_GROUP_ID>|${SECURITY_GROUP_ID}|g" \
+        -e "s|<YOUR_SSH_KEY_ID>|${SSH_KEY_ID}|g" \
+        test/integration/tkemachinenodeclass-datadisk-encrypt.yaml.tpl > test/integration/tkemachinenodeclass-datadisk-encrypt.yaml
+
+    run_kubectl apply -f test/integration/tkemachinenodeclass-datadisk-encrypt.yaml
+    run_kubectl apply -f test/integration/nodepool.yaml
+    run_kubectl apply -f test/integration/deployment.yaml
+    run_kubectl scale deployment inflate --replicas=1
+
+    local node_a machine_a disk_id_a
+    node_a=$(wait_for_node_ready 60)
+    machine_a=$(run_kubectl get nodeclaims -o jsonpath='{.items[0].metadata.annotations.karpenter\.k8s\.tke/owned-machine}')
+    [ -z "${machine_a}" ] && log_fail "Sub-scenario A: could not get machine name from NodeClaim."
+    log_info "Sub-scenario A: machine=${machine_a}, node=${node_a}"
+
+    disk_id_a=$(run_kubectl get machine "${machine_a}" -o jsonpath='{.spec.providerSpec.value.dataDisks[0].diskID}')
+    local size_a encrypt_a
+    size_a=$(run_kubectl get machine "${machine_a}" -o jsonpath='{.spec.providerSpec.value.dataDisks[0].diskSize}')
+    encrypt_a=$(run_kubectl get machine "${machine_a}" -o jsonpath='{.spec.providerSpec.value.dataDisks[0].encrypt}')
+    log_info "Sub-scenario A providerSpec: diskID=${disk_id_a}, diskSize=${size_a}, encrypt=${encrypt_a}"
+
+    [ -z "${disk_id_a}" ]           && log_fail "Sub-scenario A: diskID is empty."
+    [ "${size_a}" != "50" ]         && log_fail "Sub-scenario A: expected diskSize=50, got '${size_a}'."
+    [ "${encrypt_a}" != "ENCRYPT" ] && log_fail "Sub-scenario A: expected encrypt='ENCRYPT', got '${encrypt_a}'."
+    log_info "Sub-scenario A: PASSED (diskID=${disk_id_a}, size=${size_a}GB, encrypt=${encrypt_a})."
+
+    run_kubectl scale deployment inflate --replicas=0
+    wait_for_node_deleted "${node_a}" 60
+    cleanup_test_resources
+
+    log_info "--- Sub-scenario B: disk WITHOUT encrypt annotation ---"
+
+    sed -e "s|<YOUR_SUBNET_ID>|${SUBNET_ID}|g" \
+        -e "s|<YOUR_SECURITY_GROUP_ID>|${SECURITY_GROUP_ID}|g" \
+        -e "s|<YOUR_SSH_KEY_ID>|${SSH_KEY_ID}|g" \
+        test/integration/tkemachinenodeclass-datadisk-noencrypt.yaml.tpl > test/integration/tkemachinenodeclass-datadisk-noencrypt.yaml
+
+    run_kubectl apply -f test/integration/tkemachinenodeclass-datadisk-noencrypt.yaml
+    run_kubectl apply -f test/integration/nodepool.yaml
+    run_kubectl apply -f test/integration/deployment.yaml
+    run_kubectl scale deployment inflate --replicas=1
+
+    local node_b machine_b disk_id_b
+    node_b=$(wait_for_node_ready 60)
+    machine_b=$(run_kubectl get nodeclaims -o jsonpath='{.items[0].metadata.annotations.karpenter\.k8s\.tke/owned-machine}')
+    [ -z "${machine_b}" ] && log_fail "Sub-scenario B: could not get machine name from NodeClaim."
+    log_info "Sub-scenario B: machine=${machine_b}, node=${node_b}"
+
+    disk_id_b=$(run_kubectl get machine "${machine_b}" -o jsonpath='{.spec.providerSpec.value.dataDisks[0].diskID}')
+    local size_b encrypt_b
+    size_b=$(run_kubectl get machine "${machine_b}" -o jsonpath='{.spec.providerSpec.value.dataDisks[0].diskSize}')
+    encrypt_b=$(run_kubectl get machine "${machine_b}" -o jsonpath='{.spec.providerSpec.value.dataDisks[0].encrypt}')
+    log_info "Sub-scenario B providerSpec: diskID=${disk_id_b}, diskSize=${size_b}, encrypt=${encrypt_b}"
+
+    [ -z "${disk_id_b}" ]   && log_fail "Sub-scenario B: diskID is empty."
+    [ "${size_b}" != "50" ] && log_fail "Sub-scenario B: expected diskSize=50, got '${size_b}'."
+    [ -n "${encrypt_b}" ]   && log_fail "Sub-scenario B: expected encrypt to be empty (no annotation), got '${encrypt_b}'."
+    log_info "Sub-scenario B: PASSED (diskID=${disk_id_b}, size=${size_b}GB, encrypt field absent as expected)."
+
+    run_kubectl scale deployment inflate --replicas=0
+    wait_for_node_deleted "${node_b}" 60
+
+    cleanup_test_resources
+    log_pass "--- PASSED: test_datadisk_encrypt ---"
+}
+
 # --- Main Execution ---
 
 main() {
@@ -566,8 +808,20 @@ main() {
 
     setup_dependencies
     discover_and_setup_environment
-    build_and_push_image
-    install_karpenter
+
+    # INSTALL_KARPENTER=true  -> rebuild image and reinstall Karpenter (requires AK/SK in ./secret)
+    # INSTALL_KARPENTER=false -> skip build/install, reuse the running Karpenter deployment (default)
+    if [ "${INSTALL_KARPENTER:-false}" = "true" ]; then
+        export IMAGE_TAG="test-$(date +%s)"
+        build_and_push_image
+        install_karpenter
+    else
+        log_info "Skipping Karpenter installation (INSTALL_KARPENTER is not 'true'). Reusing existing deployment."
+        if ! run_kubectl get deployment karpenter -n karpenter > /dev/null 2>&1; then
+            log_fail "No running Karpenter deployment found. Set INSTALL_KARPENTER=true to install."
+        fi
+        wait_for_crds_established
+    fi
 
     # Run all test cases. Each test generates its own required YAML files.
     test_happy_path
@@ -576,6 +830,8 @@ main() {
     test_zone_constraint
     test_expiry
     test_multi_nodepool_fallback
+    test_kernel_args
+    test_datadisk_encrypt
 
     log_pass "All integration tests completed successfully!"
 }
