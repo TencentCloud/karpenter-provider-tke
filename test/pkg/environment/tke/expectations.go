@@ -17,7 +17,6 @@ limitations under the License.
 package tke
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -73,76 +72,14 @@ func (env *Environment) ExpectKernelArg(nodeName, param, expected string) {
 	GinkgoHelper()
 	// Convert kernel param format (e.g. "vm.max_map_count") to /proc/sys/ path (e.g. "vm/max_map_count")
 	procPath := "/proc/sys/" + strings.ReplaceAll(param, ".", "/")
+	// Sanitize param for use in pod names: replace dots and underscores with dashes
+	sanitizedParam := strings.NewReplacer(".", "-", "_", "-").Replace(param)
 
 	privileged := true
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("kernel-check-%s", strings.ReplaceAll(param, ".", "-")),
-			Namespace: "default",
-			Labels: map[string]string{
-				coretest.DiscoveryLabel: "unspecified",
-			},
-		},
-		Spec: corev1.PodSpec{
-			NodeName:      nodeName,
-			RestartPolicy: corev1.RestartPolicyNever,
-			Tolerations: []corev1.Toleration{
-				{
-					Key:      "karpenter-test",
-					Operator: corev1.TolerationOpEqual,
-					Value:    "true",
-					Effect:   corev1.TaintEffectNoSchedule,
-				},
-			},
-			Containers: []corev1.Container{
-				{
-					Name:    "check",
-					Image:   coretest.DefaultImage,
-					Command: []string{"cat", procPath},
-					SecurityContext: &corev1.SecurityContext{
-						Privileged: &privileged,
-					},
-				},
-			},
-		},
-	}
-
-	Expect(env.Client.Create(env.Context, pod)).To(Succeed())
-	defer func() {
-		_ = client.IgnoreNotFound(env.Client.Delete(env.Context, pod, client.PropagationPolicy(metav1.DeletePropagationForeground)))
-	}()
-
-	// Wait for the pod to complete
-	Eventually(func(g Gomega) {
-		p := &corev1.Pod{}
-		g.Expect(env.Client.Get(env.Context, client.ObjectKeyFromObject(pod), p)).To(Succeed())
-		g.Expect(p.Status.Phase).To(BeElementOf(corev1.PodSucceeded, corev1.PodFailed))
-	}).WithTimeout(5 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
-
-	// Read the pod log to get the value
-	p := &corev1.Pod{}
-	Expect(env.Client.Get(env.Context, client.ObjectKeyFromObject(pod), p)).To(Succeed())
-	Expect(p.Status.Phase).To(Equal(corev1.PodSucceeded),
-		fmt.Sprintf("kernel check pod for %s did not succeed", param))
-
-	// Get the value from the pod's termination message or logs
-	// Since we use cat, check the container's termination state
-	for _, cs := range p.Status.ContainerStatuses {
-		if cs.Name == "check" && cs.State.Terminated != nil {
-			// The output should be in logs, but for simplicity we use a
-			// different approach: check the pod log via kubernetes API
-		}
-	}
-
-	// Use a secondary approach: read the value using a ConfigMap or exec
-	// For e2e tests, the simplest approach is to validate by running the pod
-	// with a command that exits 0 if the value matches
-	_ = client.IgnoreNotFound(env.Client.Delete(context.Background(), pod, client.PropagationPolicy(metav1.DeletePropagationForeground)))
-
-	// Re-create with a validation command
+	// Validate by running a pod that exits 0 if the value matches, 1 otherwise
 	validatePod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("kernel-validate-%s", strings.ReplaceAll(param, ".", "-")),
+			Name:      fmt.Sprintf("kernel-validate-%s", sanitizedParam),
 			Namespace: "default",
 			Labels: map[string]string{
 				coretest.DiscoveryLabel: "unspecified",
@@ -186,7 +123,7 @@ func (env *Environment) ExpectKernelArg(nodeName, param, expected string) {
 		g.Expect(p.Status.Phase).To(BeElementOf(corev1.PodSucceeded, corev1.PodFailed))
 	}).WithTimeout(5 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 
-	p = &corev1.Pod{}
+	p := &corev1.Pod{}
 	Expect(env.Client.Get(env.Context, client.ObjectKeyFromObject(validatePod), p)).To(Succeed())
 	if p.Status.Phase != corev1.PodSucceeded {
 		msg := ""
@@ -196,6 +133,92 @@ func (env *Environment) ExpectKernelArg(nodeName, param, expected string) {
 			}
 		}
 		Fail(fmt.Sprintf("kernel param %s validation failed: %s", param, msg))
+	}
+}
+
+// ExpectKubeletArg verifies a kubelet flag is present in the kubelet process arguments on the given node.
+// It schedules a privileged pod to read /proc and checks for the flag.
+// For "max-pods", it directly checks node.status.capacity.pods via the Kubernetes API.
+func (env *Environment) ExpectKubeletArg(nodeName, flagName, expectedValue string) {
+	GinkgoHelper()
+
+	// Special case: max-pods is reflected directly in node capacity, so we verify via K8s API
+	if flagName == "max-pods" {
+		Eventually(func(g Gomega) {
+			node := env.GetNode(nodeName)
+			pods := node.Status.Capacity[corev1.ResourcePods]
+			g.Expect(pods.String()).To(Equal(expectedValue),
+				fmt.Sprintf("expected node %s to have max-pods=%s but got %s", nodeName, expectedValue, pods.String()))
+		}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+		return
+	}
+
+	// For other kubelet flags, verify via a privileged pod checking /proc
+	privileged := true
+	podName := fmt.Sprintf("kubelet-check-%s", strings.ReplaceAll(flagName, "-", ""))
+	// Truncate pod name to 63 chars to satisfy DNS label constraints
+	if len(podName) > 63 {
+		podName = podName[:63]
+	}
+	expected := fmt.Sprintf("--%s=%s", flagName, expectedValue)
+
+	validatePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: "default",
+			Labels: map[string]string{
+				coretest.DiscoveryLabel: "unspecified",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:      nodeName,
+			RestartPolicy: corev1.RestartPolicyNever,
+			HostPID:       true,
+			Tolerations: []corev1.Toleration{
+				{
+					Key:      "karpenter-test",
+					Operator: corev1.TolerationOpEqual,
+					Value:    "true",
+					Effect:   corev1.TaintEffectNoSchedule,
+				},
+			},
+			Containers: []corev1.Container{
+				{
+					Name:  "validate",
+					Image: "busybox:latest",
+					Command: []string{"sh", "-c",
+						fmt.Sprintf(`found=0; for f in /proc/*/cmdline; do [ -r "$f" ] || continue; val=$(cat "$f" 2>/dev/null | tr '\0' '\n' | grep -cF '%s' 2>/dev/null || true); [ "$val" -gt 0 ] 2>/dev/null && found=1 && break; done; if [ "$found" = "1" ]; then exit 0; else echo "kubelet arg %s not found" > /dev/termination-log; exit 1; fi`,
+							expected, expected),
+					},
+					SecurityContext: &corev1.SecurityContext{
+						Privileged: &privileged,
+					},
+				},
+			},
+		},
+	}
+
+	Expect(env.Client.Create(env.Context, validatePod)).To(Succeed())
+	defer func() {
+		_ = client.IgnoreNotFound(env.Client.Delete(env.Context, validatePod, client.PropagationPolicy(metav1.DeletePropagationForeground)))
+	}()
+
+	Eventually(func(g Gomega) {
+		p := &corev1.Pod{}
+		g.Expect(env.Client.Get(env.Context, client.ObjectKeyFromObject(validatePod), p)).To(Succeed())
+		g.Expect(p.Status.Phase).To(BeElementOf(corev1.PodSucceeded, corev1.PodFailed))
+	}).WithTimeout(5 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+
+	p := &corev1.Pod{}
+	Expect(env.Client.Get(env.Context, client.ObjectKeyFromObject(validatePod), p)).To(Succeed())
+	if p.Status.Phase != corev1.PodSucceeded {
+		msg := ""
+		for _, cs := range p.Status.ContainerStatuses {
+			if cs.State.Terminated != nil {
+				msg = cs.State.Terminated.Message
+			}
+		}
+		Fail(fmt.Sprintf("kubelet arg --%s=%s validation failed on node %s: %s", flagName, expectedValue, nodeName, msg))
 	}
 }
 
