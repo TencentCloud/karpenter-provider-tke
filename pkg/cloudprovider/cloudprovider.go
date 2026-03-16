@@ -105,7 +105,9 @@ func (c CloudProvider) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v1
 	}
 	mc, providerSpec, err := c.machineProvider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
-		c.instancetypeProvider.BlockInstanceType(ctx, providerSpec.InstanceType, mc.GetLabels()[v1.CapacityTypeLabelKey], mc.Spec.Zone, fmt.Sprintf("create machine block: %s", err.Error()))
+		if providerSpec != nil && mc != nil {
+			c.instancetypeProvider.BlockInstanceType(ctx, providerSpec.InstanceType, mc.GetLabels()[v1.CapacityTypeLabelKey], mc.Spec.Zone, fmt.Sprintf("create machine block: %s", err.Error()))
+		}
 		return nil, err
 	}
 	return c.machineToNodeClaim(ctx, mc)
