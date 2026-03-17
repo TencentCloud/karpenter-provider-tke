@@ -32,11 +32,13 @@ import (
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	"github.com/tencentcloud/karpenter-provider-tke/pkg/apis/v1beta1"
+	capiv1beta1 "github.com/tencentcloud/karpenter-provider-tke/staging/nativenode/v1beta1"
 	"github.com/tencentcloud/karpenter-provider-tke/test/pkg/environment/common"
 )
 
 func init() {
 	_ = v1beta1.AddToScheme(scheme.Scheme)
+	_ = capiv1beta1.AddToScheme(scheme.Scheme)
 }
 
 type Environment struct {
