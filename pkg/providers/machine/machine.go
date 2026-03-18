@@ -203,6 +203,14 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 		providerSpec.SystemDisk.DiskSize = 50
 		providerSpec.SystemDisk.DiskType = capiv1beta1.CloudPremiumDiskType
 	}
+	// System disk encryption via NodeClass annotation
+	annots := nodeClass.GetAnnotations()
+	if encrypt, ok := annots[api.AnnotationSystemDiskEncryptKey]; ok && encrypt != "" {
+		providerSpec.SystemDisk.Encrypt = encrypt
+	}
+	if kmsID, ok := annots[api.AnnotationSystemDiskKMSID]; ok && kmsID != "" {
+		providerSpec.SystemDisk.KmsKeyId = kmsID
+	}
 	dataDisksThroughput := p.getTargetAnnotations(api.AnnotationDataDisksThroughputKey, nodeClass.GetAnnotations())
 	dataDisksEncrypt := p.getTargetAnnotations(api.AnnotationDataDisksEncryptKey, nodeClass.GetAnnotations())
 	dataDisksKMSID := p.getTargetAnnotations(api.AnnotationDataDisksKMSID, nodeClass.GetAnnotations())

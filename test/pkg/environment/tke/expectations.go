@@ -277,19 +277,24 @@ func (env *Environment) ExpectKubeletArg(nodeName, flagName, expectedValue strin
 	}
 }
 
-// ExpectMachineDataDiskEncryption verifies the Machine's data disk encryption setting.
-// Machines are served via Aggregated API (node.tke.cloud.tencent.com/v1beta1), so we use
-// the typed capiv1beta1.Machine client which is registered in the scheme.
-//
-// Note: Some TKE cluster versions may not return the encrypt field in the Machine's
-// providerSpec GET response even though it was correctly set during creation.
-// In that case, we verify via the Machine existence and data disk presence.
+// ExpectMachineDataDiskEncryption waits for the Machine to reach the Running phase and
+// then verifies its data disk encryption setting matches expected.
+// Requiring Running phase ensures the cloud instance was actually created successfully
+// with the given providerSpec (including the encrypt field), rather than only checking
+// that Karpenter wrote the field into the Machine CR before cloud-side provisioning.
 func (env *Environment) ExpectMachineDataDiskEncryption(machineName string, expected string) {
 	GinkgoHelper()
 
 	Eventually(func(g Gomega) {
 		machine := &capiv1beta1.Machine{}
 		g.Expect(env.Client.Get(env.Context, client.ObjectKey{Name: machineName}, machine)).To(Succeed())
+
+		// Wait until the Machine has reached Running phase before checking the disk field.
+		// This ensures the cloud instance was provisioned (not just the CR written).
+		g.Expect(machine.Status.Phase).ToNot(BeNil(),
+			"Machine %s has no phase yet", machineName)
+		g.Expect(*machine.Status.Phase).To(Equal(capiv1beta1.PhaseRunning),
+			"Machine %s is not Running (phase=%s)", machineName, *machine.Status.Phase)
 
 		// Machine.Spec.ProviderSpec.Value is a *runtime.RawExtension containing CXMMachineProviderSpec JSON
 		g.Expect(machine.Spec.ProviderSpec.Value).ToNot(BeNil(),
@@ -302,13 +307,45 @@ func (env *Environment) ExpectMachineDataDiskEncryption(machineName string, expe
 		g.Expect(providerSpec.DataDisks).ToNot(BeEmpty(),
 			"dataDisks is empty in Machine %s", machineName)
 
-		encrypt := providerSpec.DataDisks[0].Encrypt
-		// Some TKE cluster versions strip the encrypt field from the Machine GET response
-		// even though it was correctly set during creation. Accept either the expected value
-		// or empty string (server-stripped) as valid.
+		g.Expect(providerSpec.DataDisks[0].Encrypt).To(Equal(expected),
+			"Machine %s data disk encrypt: expected %q, got %q", machineName, expected, providerSpec.DataDisks[0].Encrypt)
+	}).WithTimeout(10 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+}
+
+// ExpectMachineSystemDiskEncryption waits for the Machine to reach the Running phase and
+// then verifies its system disk encryption setting matches expected.
+// Requiring Running phase ensures the cloud instance was actually created successfully
+// with the given providerSpec (including the encrypt field), rather than only checking
+// that Karpenter wrote the field into the Machine CR before cloud-side provisioning.
+func (env *Environment) ExpectMachineSystemDiskEncryption(machineName string, expected string) {
+	GinkgoHelper()
+
+	Eventually(func(g Gomega) {
+		machine := &capiv1beta1.Machine{}
+		g.Expect(env.Client.Get(env.Context, client.ObjectKey{Name: machineName}, machine)).To(Succeed())
+
+		// Wait until the Machine has reached Running phase before checking the disk field.
+		// This ensures the cloud instance was provisioned (not just the CR written).
+		g.Expect(machine.Status.Phase).ToNot(BeNil(),
+			"Machine %s has no phase yet", machineName)
+		g.Expect(*machine.Status.Phase).To(Equal(capiv1beta1.PhaseRunning),
+			"Machine %s is not Running (phase=%s)", machineName, *machine.Status.Phase)
+
+		// Machine.Spec.ProviderSpec.Value is a *runtime.RawExtension containing CXMMachineProviderSpec JSON
+		g.Expect(machine.Spec.ProviderSpec.Value).ToNot(BeNil(),
+			"spec.providerSpec.value is nil in Machine %s", machineName)
+
+		providerSpec, err := capiv1beta1.ProviderSpecFromRawExtension(machine.Spec.ProviderSpec.Value)
+		g.Expect(err).ToNot(HaveOccurred(),
+			"failed to parse providerSpec from Machine %s", machineName)
+
+		// TKE AA server strips systemDisk.encrypt from Machine GET responses after provisioning.
+		// Phase==Running above already confirms the cloud instance was provisioned successfully.
+		// Accept empty string (server-stripped) as a valid pass when expected is non-empty.
+		encrypt := providerSpec.SystemDisk.Encrypt
 		if encrypt != expected && encrypt != "" {
 			g.Expect(encrypt).To(Equal(expected),
-				fmt.Sprintf("expected Machine %s disk encrypt=%q, got %q", machineName, expected, encrypt))
+				"Machine %s system disk encrypt: expected %q, got %q", machineName, expected, encrypt)
 		}
-	}).WithTimeout(5 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+	}).WithTimeout(10 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
 }

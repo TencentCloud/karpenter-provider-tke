@@ -150,6 +150,9 @@ var (
 	AnnotationDataDisksKMSID            = "beta." + Group + ".datadisks/kms-id"
 	AnnotationDataDisksSnapshotID       = "beta." + Group + ".datadisks/snapshot-id"
 	AnnotationDataDisksImageCacheID     = "beta." + Group + ".datadisks/image-cache-id"
+
+	AnnotationSystemDiskEncryptKey = "beta." + Group + ".systemdisk/encrypt"
+	AnnotationSystemDiskKMSID      = "beta." + Group + ".systemdisk/kms-id"
 )
 
 var (
