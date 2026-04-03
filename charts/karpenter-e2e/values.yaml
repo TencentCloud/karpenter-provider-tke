@@ -1,0 +1,61 @@
+image:
+  repository: ccr.ccs.tencentyun.com/test/karpenter-tke-e2e
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Test configuration
+#
+# 环境变量解析优先级（代码位于 test/pkg/environment/tke/environment.go）：
+#   1. 环境变量（来自下方 envSecret，可选）
+#   2. cache 文件（test/integration/env.cache）
+#   3. 自动从集群发现（无需云 API：从节点标签 + TKEMachineNodeClass 资源读取）
+#   4. panic
+#
+# 默认零配置：无需提供任何 Secret，自动发现会：
+#   - 从节点标签读取 Region / Zone
+#   - 从集群内已有的 TKEMachineNodeClass 对象读取 SubnetID / SecurityGroupID / SSHKeyID
+#
+# 仅在需要覆盖自动发现结果时才配置 envSecret。
+envSecret:
+  # 是否启用 Secret 注入（false = 不挂载任何 Secret，使用零配置自动发现）
+  enabled: false
+  name: "e2e-env"
+  # If create=true, the chart will create the Secret from the env field below
+  create: false
+  env: {}
+    # --- 全部可选，不填则自动发现 ---
+    # REGION: ap-guangzhou
+    # SUBNET_ID: subnet-xxx
+    # SECURITY_GROUP_ID: sg-xxx
+    # SSH_KEY_ID: skey-xxx
+    # ZONE_ID: "100006"
+    # ZONE: ap-guangzhou-6
+    # CLUSTER_NAME: cls-xxx
+    # CCR_PREFIX: "ccr"
+
+# Which suites to run (space-separated)
+testSuites: "integration lifecycle consolidation scheduling storage"
+
+# Test timeouts
+testTimeout: "2h"
+ginkgoTimeout: "1.5h"
+
+# ConfigMap name where results are written (same namespace as Job)
+report:
+  configMapName: "e2e-test-report"
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Job settings
+job:
+  backoffLimit: 0
+  activeDeadlineSeconds: 10800   # 3h hard timeout
+  ttlSecondsAfterFinished: 86400 # auto-cleanup after 1 day
+
+resources: {}
+nodeSelector:
+  kubernetes.io/os: linux
+tolerations: []

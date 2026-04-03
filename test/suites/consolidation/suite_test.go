@@ -127,6 +127,11 @@ var _ = Describe("Consolidation", func() {
 			dep.Spec.Replicas = lo.ToPtr[int32](1)
 			By("making the nodes empty")
 			env.ExpectUpdated(dep)
+			// Wait for scale-down to complete so nodes are actually empty before
+			// starting the "no disruption" window. Without this wait, Karpenter may
+			// not yet see the nodes as consolidation candidates when the check begins,
+			// making the test pass trivially rather than exercising the budget logic.
+			env.EventuallyExpectHealthyPodCount(selector, 1)
 
 			// With budget of 0, no consolidation should happen
 			env.ConsistentlyExpectNoDisruptions(int(numPods), time.Minute)

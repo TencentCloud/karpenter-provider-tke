@@ -1,0 +1,77 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "karpenter-e2e.fullname" . }}
+  labels:
+    {{- include "karpenter-e2e.labels" . | nindent 4 }}
+rules:
+  # Karpenter core resources
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodepools", "nodepools/status", "nodeclaims", "nodeclaims/status"]
+    verbs: ["*"]
+  - apiGroups: ["karpenter.k8s.tke"]
+    resources: ["tkemachinenodeclasses", "tkemachinenodeclasses/status"]
+    verbs: ["*"]
+  - apiGroups: ["node.tke.cloud.tencent.com"]
+    resources: ["machines"]
+    verbs: ["*"]
+  # Nodes
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "delete", "update"]
+  # Workloads (cross-namespace)
+  - apiGroups: ["", "apps", "policy"]
+    resources:
+      - pods
+      - deployments
+      - statefulsets
+      - replicasets
+      - daemonsets
+      - poddisruptionbudgets
+      - replicationcontrollers
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  # Storage
+  - apiGroups: [""]
+    resources: ["persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["*"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes"]
+    verbs: ["*"]
+  # Namespaces
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  # CRDs
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch", "patch"]
+  # Leases (leader election used by test env)
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["*"]
+  # Secrets (may be needed by test env)
+  - apiGroups: [""]
+    resources: ["secrets", "serviceaccounts", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "karpenter-e2e.fullname" . }}
+  labels:
+    {{- include "karpenter-e2e.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "karpenter-e2e.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "karpenter-e2e.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

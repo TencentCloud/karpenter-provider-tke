@@ -1,0 +1,6 @@
+apiVersion: v2
+name: karpenter-e2e
+description: E2E tests for karpenter-provider-tke, runs as a Kubernetes Job
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

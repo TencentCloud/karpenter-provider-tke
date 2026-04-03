@@ -1,0 +1,38 @@
+# ---- Build Stage ----
+FROM golang:1.25 AS builder
+WORKDIR /workspace
+COPY . .
+ENV CGO_ENABLED=0 GOOS=linux
+
+RUN go test -c -v -o /e2e-integration    ./test/suites/integration/
+RUN go test -c -v -o /e2e-lifecycle      ./test/suites/lifecycle/
+RUN go test -c -v -o /e2e-consolidation  ./test/suites/consolidation/
+RUN go test -c -v -o /e2e-scheduling     ./test/suites/scheduling/
+RUN go test -c -v -o /e2e-storage        ./test/suites/storage/
+
+# ---- Runtime Stage ----
+FROM mirrors.tencent.com/tencentos/tencentos4:latest
+
+# Install kubectl for writing ConfigMap results
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+    && chmod +x kubectl \
+    && mv kubectl /usr/local/bin/kubectl \
+    || yum install -y kubectl \
+    || true
+
+COPY --from=builder /e2e-integration   /usr/local/bin/e2e-integration
+COPY --from=builder /e2e-lifecycle     /usr/local/bin/e2e-lifecycle
+COPY --from=builder /e2e-consolidation /usr/local/bin/e2e-consolidation
+COPY --from=builder /e2e-scheduling    /usr/local/bin/e2e-scheduling
+COPY --from=builder /e2e-storage       /usr/local/bin/e2e-storage
+COPY hack/run-e2e.sh /usr/local/bin/run-e2e.sh
+COPY hack/gen-report.py /usr/local/bin/gen-report.py
+
+RUN chmod +x /usr/local/bin/run-e2e.sh \
+    /usr/local/bin/e2e-integration \
+    /usr/local/bin/e2e-lifecycle \
+    /usr/local/bin/e2e-consolidation \
+    /usr/local/bin/e2e-scheduling \
+    /usr/local/bin/e2e-storage
+
+ENTRYPOINT ["/usr/local/bin/run-e2e.sh"]

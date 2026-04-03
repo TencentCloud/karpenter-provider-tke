@@ -1,0 +1,28 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "karpenter-e2e.fullname" . }}-report-writer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karpenter-e2e.labels" . | nindent 4 }}
+rules:
+  # Write test report to ConfigMap
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "karpenter-e2e.fullname" . }}-report-writer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karpenter-e2e.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "karpenter-e2e.fullname" . }}-report-writer
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "karpenter-e2e.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

@@ -17,153 +17,107 @@ limitations under the License.
 package tke
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"strings"
 
-	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
-	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
-	cvm2017 "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/cvm/v20170312"
-	vpc2017 "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/vpc/v20170312"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/tencentcloud/karpenter-provider-tke/pkg/providers/zone"
+	capiv1beta1 "github.com/tencentcloud/karpenter-provider-tke/staging/nativenode/v1beta1"
 )
 
-// discoverFromCluster uses K8s node labels and Tencent Cloud SDK to auto-discover
-// the cloud resource configuration needed for E2E tests.
+// discoverFromCluster uses in-cluster Kubernetes resources to auto-discover
+// the cloud configuration needed for E2E tests.
+//
+// Discovery strategy (no cloud API calls, no credentials required):
+//
+//	Region   : node label "topology.kubernetes.io/region" (short code mapped to full name)
+//	ZoneID   : node label "topology.kubernetes.io/zone"   (TKE stores numeric zone ID here)
+//	Zone     : Machine.Spec.Zone
+//	SubnetID : Machine.Spec.SubnetID
+//	SecurityGroupID : Machine.Spec.ProviderSpec (CXMMachineProviderSpec).SecurityGroupIDs[0]
+//	SSHKeyID        : Machine.Spec.ProviderSpec (CXMMachineProviderSpec).KeyIDs[0]
+//	CCRPrefix: derived from Region via local lookup table
 func (env *Environment) discoverFromCluster() {
-	secretID, secretKey, err := loadCredentials()
-	if err != nil {
-		panic(fmt.Sprintf("auto-discover: failed to load credentials: %v", err))
-	}
+	ctx := context.Background()
 
-	// Create K8s client from the existing rest.Config
+	// ── 1. Region / ZoneID from node labels ──────────────────────────────────
 	kubeClient, err := kubernetes.NewForConfig(env.Config)
 	if err != nil {
 		panic(fmt.Sprintf("auto-discover: failed to create kubernetes client: %v", err))
 	}
-
-	// Get the first node
-	nodes, err := kubeClient.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{Limit: 1})
+	nodes, err := kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
 	if err != nil || len(nodes.Items) == 0 {
 		panic(fmt.Sprintf("auto-discover: failed to list nodes: %v", err))
 	}
 	node := nodes.Items[0]
 
-	// Read labels
-	instanceID := node.Labels["cloud.tencent.com/node-instance-id"]
 	shortRegion := node.Labels["topology.kubernetes.io/region"]
-	if instanceID == "" {
-		panic("auto-discover: node missing label cloud.tencent.com/node-instance-id")
-	}
+	// In TKE clusters the "zone" label carries the numeric zone ID (e.g. "100006")
+	zoneID := node.Labels["topology.kubernetes.io/zone"]
 	if shortRegion == "" {
 		panic("auto-discover: node missing label topology.kubernetes.io/region")
 	}
-	log.Printf("auto-discover: node=%s instanceID=%s shortRegion=%s", node.Name, instanceID, shortRegion)
-
-	// Map short region to full region name
 	fullRegion := mapShortRegion(shortRegion)
-	log.Printf("auto-discover: mapped region %q -> %q", shortRegion, fullRegion)
+	log.Printf("auto-discover: node=%s region=%s zoneID=%s", node.Name, fullRegion, zoneID)
 
-	// Create SDK clients
-	credential := common.NewCredential(secretID, secretKey)
-	pf := profile.NewClientProfile()
-	pf.Language = "en-US"
-
-	cvmClient, err := cvm2017.NewClient(credential, fullRegion, pf)
-	if err != nil {
-		panic(fmt.Sprintf("auto-discover: failed to create CVM client: %v", err))
+	// ── 2. SubnetID / Zone / SecurityGroupID / SSHKeyID from Machine objects ─
+	machineList := &capiv1beta1.MachineList{}
+	if listErr := env.Client.List(ctx, machineList, &client.ListOptions{}); listErr != nil {
+		panic(fmt.Sprintf("auto-discover: failed to list Machines: %v", listErr))
+	}
+	if len(machineList.Items) == 0 {
+		panic("auto-discover: no Machine objects found in cluster; " +
+			"ensure the cluster has at least one existing node managed by the machine controller")
 	}
 
-	// DescribeInstances to get VPC ID, Zone, SecurityGroup, SubnetId
-	descReq := cvm2017.NewDescribeInstancesRequest()
-	descReq.Filters = []*cvm2017.Filter{
-		{
-			Name:   strPtr("instance-id"),
-			Values: []*string{&instanceID},
-		},
-	}
-	descResp, err := cvmClient.DescribeInstances(descReq)
-	if err != nil {
-		panic(fmt.Sprintf("auto-discover: DescribeInstances failed: %v", err))
-	}
-	if len(descResp.Response.InstanceSet) == 0 {
-		panic(fmt.Sprintf("auto-discover: instance %s not found", instanceID))
-	}
-	inst := descResp.Response.InstanceSet[0]
-
-	zoneName := ptrStr(inst.Placement.Zone)
-	vpcID := ptrStr(inst.VirtualPrivateCloud.VpcId)
-	subnetID := ptrStr(inst.VirtualPrivateCloud.SubnetId)
-
-	var securityGroupID string
-	if len(inst.SecurityGroupIds) > 0 {
-		securityGroupID = ptrStr(inst.SecurityGroupIds[0])
-	}
-	log.Printf("auto-discover: zone=%s vpcID=%s subnetID=%s securityGroupID=%s",
-		zoneName, vpcID, subnetID, securityGroupID)
-
-	// Derive region from zone (e.g. "ap-hongkong-3" -> "ap-hongkong")
-	region := zoneToRegion(zoneName)
-
-	// Get Zone ID using zone provider
-	zoneProvider := zone.NewDefaultProvider(context.Background())
-	zoneID, err := zoneProvider.IDFromZone(zoneName)
-	if err != nil {
-		panic(fmt.Sprintf("auto-discover: IDFromZone(%s) failed: %v", zoneName, err))
-	}
-	log.Printf("auto-discover: region=%s zoneID=%s", region, zoneID)
-
-	// DescribeKeyPairs to get the first SSH Key ID
-	kpReq := cvm2017.NewDescribeKeyPairsRequest()
-	kpResp, err := cvmClient.DescribeKeyPairs(kpReq)
-	if err != nil {
-		panic(fmt.Sprintf("auto-discover: DescribeKeyPairs failed: %v", err))
-	}
-	var sshKeyID string
-	if len(kpResp.Response.KeyPairSet) > 0 {
-		sshKeyID = ptrStr(kpResp.Response.KeyPairSet[0].KeyId)
-	}
-	if sshKeyID == "" {
-		panic("auto-discover: no SSH key pairs found")
-	}
-	log.Printf("auto-discover: sshKeyID=%s", sshKeyID)
-
-	// If the node instance doesn't have a SubnetId, query VPC for one
-	if subnetID == "" {
-		vpcClient, err := vpc2017.NewClient(credential, fullRegion, pf)
-		if err != nil {
-			panic(fmt.Sprintf("auto-discover: failed to create VPC client: %v", err))
+	// Pick first Machine that has a SubnetID set.
+	var machine *capiv1beta1.Machine
+	for i := range machineList.Items {
+		if machineList.Items[i].Spec.SubnetID != "" {
+			machine = &machineList.Items[i]
+			break
 		}
-		subReq := vpc2017.NewDescribeSubnetsRequest()
-		subReq.Filters = []*vpc2017.Filter{
-			{
-				Name:   strPtr("vpc-id"),
-				Values: []*string{&vpcID},
-			},
+	}
+	if machine == nil {
+		machine = &machineList.Items[0]
+	}
+	log.Printf("auto-discover: using Machine %q", machine.Name)
+
+	subnetID := machine.Spec.SubnetID
+	zoneName := machine.Spec.Zone
+
+	// Decode ProviderSpec to extract SecurityGroupIDs and KeyIDs
+	var securityGroupID, sshKeyID string
+	if machine.Spec.ProviderSpec.Value != nil && len(machine.Spec.ProviderSpec.Value.Raw) > 0 {
+		var providerSpec capiv1beta1.CXMMachineProviderSpec
+		if jsonErr := json.Unmarshal(machine.Spec.ProviderSpec.Value.Raw, &providerSpec); jsonErr != nil {
+			log.Printf("auto-discover: WARNING: failed to decode ProviderSpec: %v", jsonErr)
+		} else {
+			if len(providerSpec.SecurityGroupIDs) > 0 {
+				securityGroupID = providerSpec.SecurityGroupIDs[0]
+			}
+			if len(providerSpec.KeyIDs) > 0 {
+				sshKeyID = providerSpec.KeyIDs[0]
+			}
 		}
-		subResp, err := vpcClient.DescribeSubnets(subReq)
-		if err != nil {
-			panic(fmt.Sprintf("auto-discover: DescribeSubnets failed: %v", err))
-		}
-		if len(subResp.Response.SubnetSet) == 0 {
-			panic(fmt.Sprintf("auto-discover: no subnets found in VPC %s", vpcID))
-		}
-		subnetID = ptrStr(subResp.Response.SubnetSet[0].SubnetId)
-		log.Printf("auto-discover: discovered subnetID=%s from VPC", subnetID)
 	}
 
-	ccrPrefix := ccrPrefixForRegion(region)
-	log.Printf("auto-discover: ccrPrefix=%s", ccrPrefix)
+	ccrPrefix := ccrPrefixForRegion(fullRegion)
+	log.Printf("auto-discover: region=%s zoneName=%s zoneID=%s subnetID=%s securityGroupID=%s sshKeyID=%s ccrPrefix=%s",
+		fullRegion, zoneName, zoneID, subnetID, securityGroupID, sshKeyID, ccrPrefix)
 
-	// Populate environment fields
+	if subnetID == "" || securityGroupID == "" {
+		panic("auto-discover: could not extract subnetID or securityGroupID from Machine objects; " +
+			"check that Machine resources have Spec.SubnetID and ProviderSpec populated")
+	}
+
+	// ── 3. Populate environment fields (only if not already set) ─────────────
 	if env.Region == "" {
-		env.Region = region
+		env.Region = fullRegion
 	}
 	if env.SubnetID == "" {
 		env.SubnetID = subnetID
@@ -184,64 +138,7 @@ func (env *Environment) discoverFromCluster() {
 		env.CCRPrefix = ccrPrefix
 	}
 
-	// Write cache for subsequent runs
-	env.writeCacheFile()
-	log.Printf("auto-discover: discovery complete")
-}
-
-// loadCredentials reads AK/SK from environment variables or the ./secret file.
-// Priority: SECRET_ID/SECRET_KEY env vars > ./secret file.
-func loadCredentials() (secretID, secretKey string, err error) {
-	secretID = os.Getenv("SECRET_ID")
-	secretKey = os.Getenv("SECRET_KEY")
-	if secretID != "" && secretKey != "" {
-		return secretID, secretKey, nil
-	}
-
-	// Try reading from secret file at candidate paths
-	for _, candidate := range []string{
-		"secret",
-		"../../../secret",
-		"../../secret",
-		"../../../../secret",
-	} {
-		sid, skey, ferr := parseSecretFile(candidate)
-		if ferr == nil && sid != "" && skey != "" {
-			return sid, skey, nil
-		}
-	}
-
-	return "", "", fmt.Errorf("credentials not found: set SECRET_ID/SECRET_KEY environment variables or create a ./secret file with SecretId:xxx and SecretKey:xxx")
-}
-
-// parseSecretFile parses a file with lines like "SecretId:xxx" / "SecretKey:xxx".
-func parseSecretFile(path string) (secretID, secretKey string, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", "", err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		switch key {
-		case "SecretId":
-			secretID = value
-		case "SecretKey":
-			secretKey = value
-		}
-	}
-	return secretID, secretKey, scanner.Err()
+	log.Printf("auto-discover: discovery complete (no cloud API calls required)")
 }
 
 // mapShortRegion maps short region codes (from node labels) to full Tencent Cloud region names.
@@ -272,60 +169,4 @@ func ccrPrefixForRegion(region string) string {
 	default:
 		return "ccr"
 	}
-}
-
-// zoneToRegion extracts the region from a zone name by removing the trailing "-N" suffix.
-// e.g. "ap-hongkong-3" -> "ap-hongkong", "ap-beijing-7" -> "ap-beijing"
-func zoneToRegion(zoneName string) string {
-	idx := strings.LastIndex(zoneName, "-")
-	if idx == -1 {
-		return zoneName
-	}
-	// Verify the suffix is numeric
-	suffix := zoneName[idx+1:]
-	for _, c := range suffix {
-		if c < '0' || c > '9' {
-			return zoneName
-		}
-	}
-	return zoneName[:idx]
-}
-
-// writeCacheFile writes the discovered environment to test/integration/env.cache.
-func (env *Environment) writeCacheFile() {
-	// Try multiple candidate paths (same as loadFromCacheFile)
-	candidates := []string{
-		"test/integration/env.cache",
-		"../../../test/integration/env.cache",
-		"../../test/integration/env.cache",
-		"../../../../test/integration/env.cache",
-	}
-
-	content := fmt.Sprintf(`# Auto-generated by Go E2E test auto-discovery.
-# Delete this file to force re-discovery.
-REGION="%s"
-SUBNET_ID="%s"
-SECURITY_GROUP_ID="%s"
-SSH_KEY_ID="%s"
-ZONE="%s"
-ZONE_ID="%s"
-CCR_PREFIX="%s"
-`, env.Region, env.SubnetID, env.SecurityGroupID, env.SSHKeyID, env.Zone, env.ZoneID, env.CCRPrefix)
-
-	for _, candidate := range candidates {
-		if err := os.WriteFile(candidate, []byte(content), 0644); err == nil {
-			log.Printf("auto-discover: wrote cache file to %s", candidate)
-			return
-		}
-	}
-	log.Printf("auto-discover: WARNING: could not write cache file to any candidate path")
-}
-
-func strPtr(s string) *string { return &s }
-
-func ptrStr(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }

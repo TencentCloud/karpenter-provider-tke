@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "karpenter-e2e.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karpenter-e2e.labels" . | nindent 4 }}
+spec:
+  backoffLimit: {{ .Values.job.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.job.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "karpenter-e2e.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "karpenter-e2e.serviceAccountName" . }}
+      restartPolicy: Never
+      containers:
+        - name: e2e-runner
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: REPORT_CM
+              value: {{ .Values.report.configMapName | quote }}
+            - name: TEST_SUITES
+              value: {{ .Values.testSuites | quote }}
+            - name: TEST_TIMEOUT
+              value: {{ .Values.testTimeout | quote }}
+            - name: GINKGO_TIMEOUT
+              value: {{ .Values.ginkgoTimeout | quote }}
+          {{- if .Values.envSecret.enabled }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.envSecret.name }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+

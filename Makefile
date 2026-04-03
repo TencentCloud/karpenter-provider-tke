@@ -1,6 +1,8 @@
 TAG?=dev
 REGISTRY?=ccr.ccs.tencentyun.com/test
 IMAGE=$(REGISTRY)/karpenter-tke-controller
+E2E_IMAGE=$(REGISTRY)/karpenter-tke-e2e
+E2E_SECRET?=e2e-env
 PROJECT_DIR := $(shell dirname $(abspath $(lastword $(MAKEFILE_LIST))))
 CONTROLLER_GEN = go run ${PROJECT_DIR}/vendor/sigs.k8s.io/controller-tools/cmd/controller-gen
 
@@ -62,4 +64,27 @@ e2etests: ## run Go e2e tests (TEST_SUITE=integration|lifecycle, FOCUS=regex)
 test: ## run unit tests with coverage report
 	go test -coverprofile=coverage.out -covermode=atomic ./pkg/... || true
 	@[ -f coverage.out ] && go tool cover -func=coverage.out || true
+
+.PHONY: e2e-image
+e2e-image: ## build and push e2e test image
+	docker build -f Dockerfile.e2e -t $(E2E_IMAGE):$(TAG) .
+	docker push $(E2E_IMAGE):$(TAG)
+
+.PHONY: e2e-deploy
+e2e-deploy: ## deploy e2e test job via helm (E2E_SECRET=<secret-name>)
+	helm upgrade --install karpenter-e2e charts/karpenter-e2e \
+		--namespace karpenter \
+		--set image.repository=$(E2E_IMAGE) \
+		--set image.tag=$(TAG) \
+		--set envSecret.name=$(E2E_SECRET)
+
+.PHONY: e2e-logs
+e2e-logs: ## stream logs from running e2e job
+	kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter-e2e --follow
+
+.PHONY: e2e-report
+e2e-report: ## print markdown e2e test report from ConfigMap
+	@kubectl get configmap -n karpenter e2e-test-report \
+		-o jsonpath='{.data.report\.md}' 2>/dev/null \
+		|| echo "(report not ready yet)"
 
