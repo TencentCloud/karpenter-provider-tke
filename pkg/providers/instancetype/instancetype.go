@@ -351,9 +351,17 @@ func (p *DefaultProvider) getInstanceTypes(ctx context.Context, arch string, isS
 	commonResponse := tchttp.NewCommonResponse()
 	err = p.client.Send(commonRequest, commonResponse)
 	if err != nil {
+		if strings.Contains(err.Error(), "ZoneNotSupported") {
+			log.FromContext(ctx).Info("DescribeZoneInstanceConfigInfos: zone not supported, skipping instance types query", "warning", err.Error())
+			return []cxm.InstanceTypeQuotaItem{}, nil
+		}
 		return nil, fmt.Errorf("failed to describe instance config infos, requestID: %v", err)
 	}
 	if err := commonResponse.ParseErrorFromHTTPResponse(commonResponse.GetBody()); err != nil {
+		if strings.Contains(err.Error(), "ZoneNotSupported") {
+			log.FromContext(ctx).Info("DescribeZoneInstanceConfigInfos: zone not supported, skipping instance types query", "warning", err.Error())
+			return []cxm.InstanceTypeQuotaItem{}, nil
+		}
 		return nil, fmt.Errorf("failed to describe instance config infos: %v", err)
 	}
 
@@ -406,6 +414,10 @@ func (p *DefaultProvider) getENILimits(ctx context.Context, nodeClass *api.TKEMa
 		req.Zone = lo.ToPtr(s.Zone)
 		resp, err := p.client2018.DescribeVpcCniPodLimitsWithContext(ctx, req)
 		if err != nil {
+			if strings.Contains(err.Error(), "ZoneNotSupported") {
+				log.FromContext(ctx).Info("DescribeVpcCniPodLimits: zone not supported, skipping zone", "zone", s.Zone, "warning", err.Error())
+				continue
+			}
 			return nil, fmt.Errorf("failed to get vpc cni pod limits: %v", err)
 		}
 		log.FromContext(ctx).V(8).Info("tencent cloud request", "action", req.GetAction(), "requestID", resp.Response.RequestId)
