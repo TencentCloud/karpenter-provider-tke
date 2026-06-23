@@ -32,14 +32,17 @@ import (
 	"github.com/tencentcloud/karpenter-provider-tke/pkg/providers/zone"
 	capiv1beta1 "github.com/tencentcloud/karpenter-provider-tke/staging/nativenode/v1beta1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/apis/core"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
 const (
@@ -466,14 +469,50 @@ func (p *DefaultProvider) Delete(ctx context.Context, nodeClaim *v1.NodeClaim) e
 			for _, o := range m.OwnerReferences {
 				if o.Kind == "NodeClaim" && o.Name == nodeClaim.Name {
 					machine = &m
+					p.removeKarpenterNodeFinalizer(ctx, nodeClaim)
 					return p.kubeClient.Delete(ctx, machine)
 				}
 			}
 		}
 	} else {
+		p.removeKarpenterNodeFinalizer(ctx, nodeClaim)
 		return p.kubeClient.Delete(ctx, machine)
 	}
 	return nil
+}
+
+// removeKarpenterNodeFinalizer removes karpenter's termination finalizer from the Node
+// corresponding to the given NodeClaim. This is required because the TKE Machine controller
+// waits for the Node to be deleted as part of its finalization, but the Node carries
+// karpenter.sh/termination which Karpenter only removes after cloudprovider.Get returns
+// NotFound — creating a deadlock. By the time this is called from Karpenter's
+// termination flow, the node has already been cordoned, drained and its volumes detached,
+// so dropping just this finalizer is safe. Best-effort: any error is logged and ignored
+// so that the Machine deletion still proceeds.
+func (p *DefaultProvider) removeKarpenterNodeFinalizer(ctx context.Context, nodeClaim *v1.NodeClaim) {
+	node, err := nodeclaimutils.NodeForNodeClaim(ctx, p.kubeClient, nodeClaim)
+	if err != nil {
+		// No node (yet) or duplicates — nothing safe to do here.
+		klog.V(4).Infof("skip removing karpenter finalizer for nodeclaim %s: %v", nodeClaim.Name, err)
+		return
+	}
+	if !controllerutil.ContainsFinalizer(node, v1.TerminationFinalizer) {
+		return
+	}
+	stored := node.DeepCopy()
+	controllerutil.RemoveFinalizer(node, v1.TerminationFinalizer)
+	if equality.Semantic.DeepEqual(stored, node) {
+		return
+	}
+	// StrategicMergeFrom preserves other finalizers under concurrent edits — same
+	// approach as upstream karpenter's node termination controller.
+	if err := p.kubeClient.Patch(ctx, node, client.StrategicMergeFrom(stored)); err != nil {
+		klog.Warningf("failed to remove karpenter finalizer from node %s for nodeclaim %s: %v",
+			node.Name, nodeClaim.Name, err)
+		return
+	}
+	klog.V(2).Infof("removed karpenter termination finalizer from node %s to unblock machine deletion for nodeclaim %s",
+		node.Name, nodeClaim.Name)
 }
 
 func (p *DefaultProvider) filterInstanceTypes(nodeClaim *v1.NodeClaim, instanceTypes []*cloudprovider.InstanceType) []*cloudprovider.InstanceType {

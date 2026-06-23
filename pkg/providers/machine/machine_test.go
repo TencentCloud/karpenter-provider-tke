@@ -230,6 +230,10 @@ func (c *simpleFakeClient) List(ctx context.Context, list client.ObjectList, opt
 	if c.listErr != nil {
 		return c.listErr
 	}
+	listOpts := &client.ListOptions{}
+	for _, o := range opts {
+		o.ApplyToList(listOpts)
+	}
 	// Handle MachineList
 	if machineList, ok := list.(*capiv1beta1.MachineList); ok {
 		machineList.Items = []capiv1beta1.Machine{}
@@ -237,6 +241,28 @@ func (c *simpleFakeClient) List(ctx context.Context, list client.ObjectList, opt
 			if machine, ok := o.(*capiv1beta1.Machine); ok {
 				machineList.Items = append(machineList.Items, *machine)
 			}
+		}
+	}
+	// Handle NodeList, honoring spec.providerID field selector used by nodeclaimutils.NodeForNodeClaim
+	if nodeList, ok := list.(*corev1.NodeList); ok {
+		wantProviderID := ""
+		if listOpts.FieldSelector != nil {
+			for _, req := range listOpts.FieldSelector.Requirements() {
+				if req.Field == "spec.providerID" {
+					wantProviderID = req.Value
+				}
+			}
+		}
+		nodeList.Items = []corev1.Node{}
+		for _, o := range c.objects {
+			node, ok := o.(*corev1.Node)
+			if !ok {
+				continue
+			}
+			if wantProviderID != "" && node.Spec.ProviderID != wantProviderID {
+				continue
+			}
+			nodeList.Items = append(nodeList.Items, *node)
 		}
 	}
 	return nil
@@ -270,6 +296,19 @@ func (c *simpleFakeClient) Update(ctx context.Context, obj client.Object, opts .
 }
 
 func (c *simpleFakeClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	// Reflect mutations onto the stored object so subsequent List calls see them.
+	// Sufficient for finalizer / deletion-timestamp assertions in our tests.
+	for i, stored := range c.objects {
+		if stored.GetName() != obj.GetName() || stored.GetNamespace() != obj.GetNamespace() {
+			continue
+		}
+		stored.SetFinalizers(obj.GetFinalizers())
+		if dt := obj.GetDeletionTimestamp(); dt != nil {
+			stored.SetDeletionTimestamp(dt)
+		}
+		c.objects[i] = stored
+		return nil
+	}
 	return nil
 }
 
@@ -3632,5 +3671,222 @@ func TestCreate_InvalidThroughput(t *testing.T) {
 	}
 	if providerSpec.DataDisks[0].ThroughputPerformance != 0 {
 		t.Errorf("Expected ThroughputPerformance to be 0 for invalid value, got %d", providerSpec.DataDisks[0].ThroughputPerformance)
+	}
+}
+
+// --- Delete tests ---
+
+const testKarpenterFinalizer = "karpenter.sh/termination"
+
+func makeMachine(name, providerID, nodeClaimName string) *capiv1beta1.Machine {
+	m := &capiv1beta1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: capiv1beta1.MachineSpec{
+			ProviderID: lo.ToPtr(providerID),
+		},
+	}
+	if nodeClaimName != "" {
+		m.OwnerReferences = []metav1.OwnerReference{{
+			Kind: "NodeClaim",
+			Name: nodeClaimName,
+		}}
+	}
+	return m
+}
+
+func makeNode(name, providerID string, finalizers []string, hasDeletionTimestamp bool) *corev1.Node {
+	n := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       name,
+			Finalizers: finalizers,
+		},
+		Spec: corev1.NodeSpec{
+			ProviderID: providerID,
+		},
+	}
+	if hasDeletionTimestamp {
+		now := metav1.Now()
+		n.DeletionTimestamp = &now
+	}
+	return n
+}
+
+func findNode(c *simpleFakeClient, name string) *corev1.Node {
+	for _, o := range c.objects {
+		if n, ok := o.(*corev1.Node); ok && n.GetName() == name {
+			return n
+		}
+	}
+	return nil
+}
+
+func findMachine(c *simpleFakeClient, name string) *capiv1beta1.Machine {
+	for _, o := range c.objects {
+		if m, ok := o.(*capiv1beta1.Machine); ok && m.GetName() == name {
+			return m
+		}
+	}
+	return nil
+}
+
+func TestDelete_StripsKarpenterFinalizerThenDeletesMachine(t *testing.T) {
+	ctx := context.Background()
+	scheme := createScheme()
+	providerID := "qcloud:///ap-guangzhou-1/ins-aaa"
+
+	machine := makeMachine("machine-aaa", providerID, "nc-aaa")
+	node := makeNode("node-aaa", providerID, []string{testKarpenterFinalizer}, true)
+	nodeClaim := &v1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "nc-aaa"},
+		Status:     v1.NodeClaimStatus{ProviderID: providerID},
+	}
+
+	fakeClient := createFakeClient(scheme, machine, node)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	if err := provider.Delete(ctx, nodeClaim); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+
+	gotNode := findNode(fakeClient, "node-aaa")
+	if gotNode == nil {
+		t.Fatalf("node was unexpectedly removed from store")
+	}
+	for _, f := range gotNode.Finalizers {
+		if f == testKarpenterFinalizer {
+			t.Fatalf("karpenter finalizer should have been removed; got %v", gotNode.Finalizers)
+		}
+	}
+	if findMachine(fakeClient, "machine-aaa") != nil {
+		t.Fatalf("expected machine to be deleted from store")
+	}
+}
+
+func TestDelete_PreservesOtherFinalizers(t *testing.T) {
+	ctx := context.Background()
+	scheme := createScheme()
+	providerID := "qcloud:///ap-guangzhou-1/ins-bbb"
+
+	machine := makeMachine("machine-bbb", providerID, "nc-bbb")
+	node := makeNode("node-bbb", providerID,
+		[]string{"ccm.io/protection", testKarpenterFinalizer, "csi.io/volume"}, true)
+	nodeClaim := &v1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "nc-bbb"},
+		Status:     v1.NodeClaimStatus{ProviderID: providerID},
+	}
+
+	fakeClient := createFakeClient(scheme, machine, node)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	if err := provider.Delete(ctx, nodeClaim); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+
+	gotNode := findNode(fakeClient, "node-bbb")
+	if gotNode == nil {
+		t.Fatalf("node missing from store")
+	}
+	want := map[string]bool{"ccm.io/protection": true, "csi.io/volume": true}
+	got := map[string]bool{}
+	for _, f := range gotNode.Finalizers {
+		if f == testKarpenterFinalizer {
+			t.Fatalf("karpenter finalizer should have been removed; got %v", gotNode.Finalizers)
+		}
+		got[f] = true
+	}
+	for w := range want {
+		if !got[w] {
+			t.Fatalf("expected finalizer %q to be preserved; got %v", w, gotNode.Finalizers)
+		}
+	}
+}
+
+func TestDelete_NoMatchingNode_StillDeletesMachine(t *testing.T) {
+	ctx := context.Background()
+	scheme := createScheme()
+	providerID := "qcloud:///ap-guangzhou-1/ins-ccc"
+
+	machine := makeMachine("machine-ccc", providerID, "nc-ccc")
+	nodeClaim := &v1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "nc-ccc"},
+		Status:     v1.NodeClaimStatus{ProviderID: providerID},
+	}
+
+	fakeClient := createFakeClient(scheme, machine)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	if err := provider.Delete(ctx, nodeClaim); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if findMachine(fakeClient, "machine-ccc") != nil {
+		t.Fatalf("expected machine to be deleted from store")
+	}
+}
+
+func TestDelete_NodeWithoutKarpenterFinalizer_NoChange(t *testing.T) {
+	ctx := context.Background()
+	scheme := createScheme()
+	providerID := "qcloud:///ap-guangzhou-1/ins-ddd"
+
+	machine := makeMachine("machine-ddd", providerID, "nc-ddd")
+	node := makeNode("node-ddd", providerID, []string{"other.io/foo"}, true)
+	nodeClaim := &v1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "nc-ddd"},
+		Status:     v1.NodeClaimStatus{ProviderID: providerID},
+	}
+
+	fakeClient := createFakeClient(scheme, machine, node)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	if err := provider.Delete(ctx, nodeClaim); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	gotNode := findNode(fakeClient, "node-ddd")
+	if gotNode == nil || len(gotNode.Finalizers) != 1 || gotNode.Finalizers[0] != "other.io/foo" {
+		t.Fatalf("expected other.io/foo finalizer to be intact; got %v", gotNode)
+	}
+}
+
+func TestDelete_OwnerRefFallback_NoProviderID(t *testing.T) {
+	ctx := context.Background()
+	scheme := createScheme()
+
+	machine := makeMachine("machine-eee", "", "nc-eee")
+	nodeClaim := &v1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "nc-eee"},
+		// No ProviderID -> fall through to OwnerReference path.
+	}
+
+	fakeClient := createFakeClient(scheme, machine)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	if err := provider.Delete(ctx, nodeClaim); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if findMachine(fakeClient, "machine-eee") != nil {
+		t.Fatalf("expected machine to be deleted")
+	}
+}
+
+func TestDelete_MachineNotFound_ReturnsNodeClaimNotFoundError(t *testing.T) {
+	ctx := context.Background()
+	scheme := createScheme()
+
+	nodeClaim := &v1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "nc-missing"},
+		// No ProviderID; no Machine in store either.
+	}
+
+	fakeClient := createFakeClient(scheme)
+	provider := NewDefaultProvider(ctx, fakeClient, &mockZoneProvider{}, "test-cluster")
+
+	err := provider.Delete(ctx, nodeClaim)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !cloudprovider.IsNodeClaimNotFoundError(err) {
+		t.Fatalf("expected NodeClaimNotFoundError, got %v", err)
 	}
 }
