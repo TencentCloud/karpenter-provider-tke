@@ -239,6 +239,7 @@ func (m *mockMachineProvider) Delete(ctx context.Context, claim *v1.NodeClaim) e
 type mockInstanceTypeProvider struct {
 	ListFn                       func(context.Context, *api.TKEMachineNodeClass, bool) ([]*cloudprovider.InstanceType, error)
 	BlockInstanceTypeFn          func(ctx context.Context, instName, capacityType, zone, message string)
+	MarkOfferingUnavailableFn    func(ctx context.Context, instName, capacityType, zone, message string, ttl time.Duration)
 	GetInsufficientFailureCountFn func(ctx context.Context, instName, capacityType, zone string) int
 	AddInsufficientFailureFn     func(ctx context.Context, instName, capacityType, zone string)
 }
@@ -253,6 +254,12 @@ func (m *mockInstanceTypeProvider) List(ctx context.Context, nc *api.TKEMachineN
 func (m *mockInstanceTypeProvider) BlockInstanceType(ctx context.Context, instName, capacityType, zone, message string) {
 	if m.BlockInstanceTypeFn != nil {
 		m.BlockInstanceTypeFn(ctx, instName, capacityType, zone, message)
+	}
+}
+
+func (m *mockInstanceTypeProvider) MarkOfferingUnavailable(ctx context.Context, instName, capacityType, zone, message string, ttl time.Duration) {
+	if m.MarkOfferingUnavailableFn != nil {
+		m.MarkOfferingUnavailableFn(ctx, instName, capacityType, zone, message, ttl)
 	}
 }
 

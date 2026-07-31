@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/awslabs/operatorpkg/controller"
+	"github.com/tencentcloud/karpenter-provider-tke/pkg/controllers/interruption"
 	nodeclaimfailure "github.com/tencentcloud/karpenter-provider-tke/pkg/controllers/nodeclaim/failure"
 	nodeclaimgarbagecollection "github.com/tencentcloud/karpenter-provider-tke/pkg/controllers/nodeclaim/garbagecollection"
 	nodeclaimproviderid "github.com/tencentcloud/karpenter-provider-tke/pkg/controllers/nodeclaim/providerid"
@@ -46,6 +47,7 @@ func NewControllers(ctx context.Context, clk clock.Clock, kubeClient client.Clie
 		nodeclaimfailure.NewController(kubeClient, instancetypeProvier),
 		nodeclassstatus.NewController(kubeClient, zoneProvider, vpcProvider, sshKeyProvider),
 		nodeclassstermination.NewController(kubeClient, recorder),
+		interruption.NewController(kubeClient, cloudProvider, instancetypeProvier, recorder),
 	}
 	return controllers
 }

@@ -51,6 +51,7 @@ type Provider interface {
 		// *v1beta1.KubeletConfiguration,
 		*api.TKEMachineNodeClass, bool) ([]*cloudprovider.InstanceType, error)
 	BlockInstanceType(ctx context.Context, instName, capacityType, zone, message string)
+	MarkOfferingUnavailable(ctx context.Context, instName, capacityType, zone, message string, ttl time.Duration)
 	GetInsufficientFailureCount(ctx context.Context, instName, capacityType, zone string) int
 	AddInsufficientFailure(ctx context.Context, instName, capacityType, zone string)
 }
@@ -227,6 +228,25 @@ func (p *DefaultProvider) BlockInstanceType(ctx context.Context, instName, capac
 		zoneLabel:         zone,
 	}).Set(1)
 	log.FromContext(ctx).WithValues("process", "blockinstancetype").Info(fmt.Sprintf("Instance type is blocked: %s", message), "instance-type", instName, "capacity-type", capacityType, "zone", zone)
+}
+
+// MarkOfferingUnavailable temporarily removes a (instName, capacityType, zone)
+// offering from List() for the duration of ttl. Same underlying blacklist key
+// as BlockInstanceType, so isBlocked picks it up, but with a caller-supplied
+// TTL — intended for short-lived exclusions such as reacting to a spot
+// interruption warning (AWS uses a 3-minute equivalent). For hard, indefinite
+// blocks (e.g. SOLD_OUT, quota exceeded), use BlockInstanceType which uses the
+// cache's default TTL.
+func (p *DefaultProvider) MarkOfferingUnavailable(ctx context.Context, instName, capacityType, zone, message string, ttl time.Duration) {
+	p.blacklistCache.Set(fmt.Sprintf("blocked-ins-%s-%s-%s", instName, capacityType, zone), true, ttl)
+	blockedInstanceType.With(prometheus.Labels{
+		instanceTypeLabel: instName,
+		capacityTypeLabel: capacityType,
+		zoneLabel:         zone,
+	}).Set(1)
+	log.FromContext(ctx).WithValues("process", "markofferingunavailable").Info(
+		fmt.Sprintf("Offering marked unavailable for %s: %s", ttl, message),
+		"instance-type", instName, "capacity-type", capacityType, "zone", zone)
 }
 
 func (p *DefaultProvider) GetInsufficientFailureCount(ctx context.Context, instName, capacityType, zone string) int {

@@ -88,7 +88,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	sshKeyProvider := sshkey.NewDefaultProvider(ctx, cvmClient)
 
 	machineProvider := machine.NewDefaultProvider(ctx, operator.GetClient(), zoneProvider, options.FromContext(ctx).ClusterID)
-	instanceTypeProvider := instancetype.NewDefaultProvider(ctx, options.FromContext(ctx).Region, operator.KubernetesInterface, operator.GetClient(), zoneProvider, commonClient, client2018, cache.New(10*time.Minute, time.Minute), cache.New(30*time.Minute, time.Minute))
+	instanceTypeProvider := instancetype.NewDefaultProvider(ctx, options.FromContext(ctx).Region, operator.KubernetesInterface, operator.GetClient(), zoneProvider, commonClient, client2018, cache.New(10*time.Minute, time.Minute), cache.New(10*time.Minute, time.Minute))
 
 	return ctx, &Operator{
 		Operator:             operator,
