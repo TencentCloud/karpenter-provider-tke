@@ -3890,3 +3890,71 @@ func TestDelete_MachineNotFound_ReturnsNodeClaimNotFoundError(t *testing.T) {
 		t.Fatalf("expected NodeClaimNotFoundError, got %v", err)
 	}
 }
+
+func TestGetTargetAnnotations_WhitespaceTolerance(t *testing.T) {
+	p := &DefaultProvider{}
+	const key = "annos"
+
+	tests := []struct {
+		name string
+		val  string
+		want map[string]string
+	}{
+		{
+			name: "no whitespace",
+			val:  "k1=v1,k2=v2",
+			want: map[string]string{"k1": "v1", "k2": "v2"},
+		},
+		{
+			name: "space after comma (reported bug)",
+			val:  "k1=v1, k2=v2",
+			want: map[string]string{"k1": "v1", "k2": "v2"},
+		},
+		{
+			name: "spaces on both sides of comma",
+			val:  "k1=v1 , k2=v2",
+			want: map[string]string{"k1": "v1", "k2": "v2"},
+		},
+		{
+			name: "spaces around equals",
+			val:  "k1 = v1 , k2 = v2",
+			want: map[string]string{"k1": "v1", "k2": "v2"},
+		},
+		{
+			name: "leading and trailing whitespace in value",
+			val:  "  k1=v1  ,  k2=v2  ",
+			want: map[string]string{"k1": "v1", "k2": "v2"},
+		},
+		{
+			name: "empty entries are skipped",
+			val:  "k1=v1,,k2=v2,",
+			want: map[string]string{"k1": "v1", "k2": "v2"},
+		},
+		{
+			name: "single entry",
+			val:  "k1=v1",
+			want: map[string]string{"k1": "v1"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := p.getTargetAnnotations(key, map[string]string{key: tc.val})
+			if len(got) != len(tc.want) {
+				t.Fatalf("expected %d entries, got %d: %#v", len(tc.want), len(got), got)
+			}
+			for k, v := range tc.want {
+				if gv, ok := got[k]; !ok || gv != v {
+					t.Errorf("expected %q=%q, got %q=%q (ok=%v)", k, v, k, gv, ok)
+				}
+			}
+		})
+	}
+}
+
+func TestGetTargetAnnotations_MissingKey_ReturnsNil(t *testing.T) {
+	p := &DefaultProvider{}
+	if got := p.getTargetAnnotations("missing", map[string]string{"other": "x=y"}); got != nil {
+		t.Fatalf("expected nil for missing key, got %#v", got)
+	}
+}

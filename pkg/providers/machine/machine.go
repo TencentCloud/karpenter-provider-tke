@@ -428,14 +428,20 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *api.TKEMachineN
 	return machine, providerSpec, err
 }
 func (p *DefaultProvider) getTargetAnnotations(targetKey string, annotations map[string]string) map[string]string {
-	// annotation value of the form "key1=value1,key2=value2"
+	// annotation value of the form "key1=value1,key2=value2"; whitespace around
+	// commas and '=' is tolerated so that "k1=v1, k2=v2" parses the same as
+	// "k1=v1,k2=v2".
 	if val, found := annotations[targetKey]; found {
 		annos := strings.Split(val, ",")
 		kv := make(map[string]string, len(annos))
 		for _, anno := range annos {
+			anno = strings.TrimSpace(anno)
+			if anno == "" {
+				continue
+			}
 			split := strings.SplitN(anno, "=", 2)
 			if len(split) == 2 {
-				kv[split[0]] = split[1]
+				kv[strings.TrimSpace(split[0])] = strings.TrimSpace(split[1])
 			}
 		}
 		return kv
